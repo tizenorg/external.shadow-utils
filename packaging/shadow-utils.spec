@@ -6,6 +6,7 @@ URL: http://pkg-shadow.alioth.debian.org/
 Source0: ftp://pkg-shadow.alioth.debian.org/pub/pkg-shadow/shadow-%{version}.tar.bz2
 Source1: shadow-4.0.17-login.defs
 Source2: shadow-4.0.18.1-useradd
+Source1001: packaging/shadow-utils.manifest 
 Patch0: shadow-4.1.4.2-redhat.patch
 Patch1: shadow-4.1.4.1-goodname.patch
 Patch2: shadow-4.1.4.2-leak.patch
@@ -37,6 +38,7 @@ iconv -f ISO88591 -t utf-8  doc/HOWTO > doc/HOWTO.utf8
 cp -f doc/HOWTO.utf8 doc/HOWTO
 
 %build
+cp %{SOURCE1001} .
 %configure \
         --enable-shadowgrp \
         --without-audit \
@@ -122,6 +124,7 @@ done
 rm -rf $RPM_BUILD_ROOT
 
 %files -f shadow.lang
+%manifest shadow-utils.manifest
 %defattr(-,root,root)
 %doc NEWS doc/HOWTO README
 %dir %{_sysconfdir}/default
