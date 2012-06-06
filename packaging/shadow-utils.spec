@@ -3,7 +3,7 @@ Name: shadow-utils
 Version: 4.1.4.2
 Release: 1
 URL: http://pkg-shadow.alioth.debian.org/
-Source0: ftp://pkg-shadow.alioth.debian.org/pub/pkg-shadow/shadow-%{version}.tar.bz2
+Source0: %{name}-%{version}.tar.bz2
 Source1: shadow-4.0.17-login.defs
 Source2: shadow-4.0.18.1-useradd
 Source1001: packaging/shadow-utils.manifest 
@@ -28,7 +28,7 @@ managing user accounts. The groupadd, groupdel, and groupmod commands
 are used for managing group accounts.
 
 %prep
-%setup -q -n shadow-%{version}
+%setup -q
 %patch0 -p1 -b .redhat
 %patch1 -p1 -b .goodname
 %patch2 -p1 -b .leak
