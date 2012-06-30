@@ -1,942 +1,776 @@
-/*
- * Copyright (c) 1989 - 1994, Julianne Frances Haugh
- * Copyright (c) 1996 - 2000, Marek Michałkiewicz
- * Copyright (c) 2000 - 2006, Tomasz Kłoczko
- * Copyright (c) 2007 - 2009, Nicolas François
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The name of the copyright holders or contributors may not be used to
- *    endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+/* Copyright (C) 2002-2006, 2008 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@thkukuk.de>
 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
+
+
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 
-#ident "$Id: chage.c 2851 2009-04-30 21:39:38Z nekral-guest $"
-
-#include <ctype.h>
-#include <fcntl.h>
-#include <getopt.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/types.h>
-#include <time.h>
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-#include "pam_defs.h"
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
 #include <pwd.h>
-#ifdef WITH_SELINUX
-#include <selinux/selinux.h>
-#include <selinux/av_permissions.h>
-#endif
-#include "prototypes.h"
-#include "defines.h"
-#include "pwio.h"
-#include "shadowio.h"
-/*@-exitarg@*/
-#include "exitcodes.h"
-
-/*
- * Global variables
- */
-char *Prog;
-
-static bool
-    dflg = false,		/* set last password change date */
-    Eflg = false,		/* set account expiration date */
-    Iflg = false,		/* set password inactive after expiration */
-    lflg = false,		/* show account aging information */
-    mflg = false,		/* set minimum number of days before password change */
-    Mflg = false,		/* set maximum number of days before password change */
-    Wflg = false;		/* set expiration warning days */
-static bool amroot = false;
-
-static bool pw_locked  = false;	/* Indicate if the password file is locked */
-static bool spw_locked = false;	/* Indicate if the shadow file is locked */
-/* The name and UID of the user being worked on */
-static char user_name[BUFSIZ] = "";
-static uid_t user_uid = -1;
-
-static long mindays;
-static long maxdays;
-static long lstchgdate;
-static long warndays;
-static long inactdays;
-static long expdate;
-
-#define	EPOCH		"1969-12-31"
-
-/* local function prototypes */
-static bool isnum (const char *s);
-static void usage (void);
-static void date_to_str (char *buf, size_t maxsize, time_t date);
-static int new_fields (void);
-static void print_date (time_t date);
-static void list_fields (void);
-static void process_flags (int argc, char **argv);
-static void check_flags (int argc, int opt_index);
-static void check_perms (void);
-static void open_files (bool readonly);
-static void close_files (void);
-static void fail_exit (int code);
-
-/*
- * fail_exit - do some cleanup and exit with the given error code
- */
-static void fail_exit (int code)
-{
-	if (spw_locked) {
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-	}
-	if (pw_locked) {
-		if (pw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-			/* continue */
-		}
-	}
-	closelog ();
-
-#ifdef WITH_AUDIT
-	if (E_SUCCESS != code) {
-		audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-		              "change age",
-		              user_name, (unsigned int) user_uid, 0);
-	}
+#include <time.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <shadow.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#ifdef HAVE_LIBNSCD_H
+#include <libnscd.h>
 #endif
 
-	exit (code);
-}
+#include "i18n.h"
+#include "error_codes.h"
+#include "public.h"
+#include "logindefs.h"
+#include "read-files.h"
+#include "utf8conv.h"
+#include "logging.h"
 
-/*
- * isnum - determine whether or not a string is a number
- */
-static bool isnum (const char *s)
+#ifdef USE_LDAP
+#include "libldap.h"
+#endif
+
+#define DAY (24L*3600L)
+#define SCALE DAY
+
+static void
+print_usage (FILE *stream, const char *program)
 {
-	while ('\0' != *s) {
-		if (!isdigit (*s)) {
-			return false;
-		}
-		s++;
-	}
-	return true;
+  fprintf (stream, _("Usage: %s [-D binddn][-P path][-m mindays][-M maxdays][-d lastday][-I inactive][-E expiredate][-W warndays] user\n"),
+	   program);
+  fprintf (stream, _("       %s -l user\n"),
+	   program);
 }
 
-/*
- * usage - print command line syntax and exit
- */
-static void usage (void)
+static void
+print_help (const char *program)
 {
-	fputs (_("Usage: chage [options] [LOGIN]\n"
-	         "\n"
-	         "Options:\n"
-	         "  -d, --lastday LAST_DAY        set date of last password change to LAST_DAY\n"
-	         "  -E, --expiredate EXPIRE_DATE  set account expiration date to EXPIRE_DATE\n"
-	         "  -h, --help                    display this help message and exit\n"
-	         "  -I, --inactive INACTIVE       set password inactive after expiration\n"
-	         "                                to INACTIVE\n"
-	         "  -l, --list                    show account aging information\n"
-	         "  -m, --mindays MIN_DAYS        set minimum number of days before password\n"
-	         "                                change to MIN_DAYS\n"
-	         "  -M, --maxdays MAX_DAYS        set maximim number of days before password\n"
-	         "                                change to MAX_DAYS\n"
-	         "  -W, --warndays WARN_DAYS      set expiration warning days to WARN_DAYS\n"
-	         "\n"), stderr);
-	exit (E_USAGE);
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - change user password expiry information\n\n"),
+	   program);
+
+#ifdef USE_LDAP
+  fputs (_("  -D binddn      Use dn \"binddn\" to bind to the LDAP directory\n"),
+         stdout);
+#endif
+  fputs (_("  -P path        Search passwd and shadow file in \"path\"\n"),
+	 stdout);
+
+  fputs (_("  --service srv  Use nameservice 'srv'\n"), stdout);
+  fputs (_("  -q, --quiet    Don't be verbose\n"), stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
+  fputs (_("Valid services are: files, nis, nisplus, ldap\n"), stdout);
 }
 
-static void date_to_str (char *buf, size_t maxsize, time_t date)
-{
-	struct tm *tp;
-
-	tp = gmtime (&date);
-#ifdef HAVE_STRFTIME
-	(void) strftime (buf, maxsize, "%Y-%m-%d", tp);
-#else
-	(void) snprintf (buf, maxsize, "%04d-%02d-%02d",
-	                 tp->tm_year + 1900, tp->tm_mon + 1, tp->tm_mday);
-#endif				/* HAVE_STRFTIME */
-}
-
-/*
- * new_fields - change the user's password aging information interactively.
- *
- * prompt the user for all of the password age values. set the fields
- * from the user's response, or leave alone if nothing was entered. The
- * value (-1) is used to indicate the field should be removed if possible.
- * any other negative value is an error. very large positive values will
- * be handled elsewhere.
- */
-static int new_fields (void)
-{
-	char buf[200];
-
-	(void) puts (_("Enter the new value, or press ENTER for the default"));
-	(void) puts ("");
-
-	snprintf (buf, sizeof buf, "%ld", mindays);
-	change_field (buf, sizeof buf, _("Minimum Password Age"));
-	if (   (getlong (buf, &mindays) == 0)
-	    || (mindays < -1)) {
-		return 0;
-	}
-
-	snprintf (buf, sizeof buf, "%ld", maxdays);
-	change_field (buf, sizeof buf, _("Maximum Password Age"));
-	if (   (getlong (buf, &maxdays) == 0)
-	    || (maxdays < -1)) {
-		return 0;
-	}
-
-	date_to_str (buf, sizeof buf, lstchgdate * SCALE);
-
-	change_field (buf, sizeof buf, _("Last Password Change (YYYY-MM-DD)"));
-
-	if (strcmp (buf, EPOCH) == 0) {
-		lstchgdate = -1;
-	} else {
-		lstchgdate = strtoday (buf);
-		if (lstchgdate == -1) {
-			return 0;
-		}
-	}
-
-	snprintf (buf, sizeof buf, "%ld", warndays);
-	change_field (buf, sizeof buf, _("Password Expiration Warning"));
-	if (   (getlong (buf, &warndays) == 0)
-	    || (warndays < -1)) {
-		return 0;
-	}
-
-	snprintf (buf, sizeof buf, "%ld", inactdays);
-	change_field (buf, sizeof buf, _("Password Inactive"));
-	if (   (getlong (buf, &inactdays) == 0)
-	    || (inactdays < -1)) {
-		return 0;
-	}
-
-	date_to_str (buf, sizeof buf, expdate * SCALE);
-
-	change_field (buf, sizeof buf,
-	              _("Account Expiration Date (YYYY-MM-DD)"));
-
-	if (strcmp (buf, EPOCH) == 0) {
-		expdate = -1;
-	} else {
-		expdate = strtoday (buf);
-		if (expdate == -1) {
-			return 0;
-		}
-	}
-
-	return 1;
-}
-
-static void print_date (time_t date)
+/* Print the time in a human readable format.  */
+static void
+print_date (time_t date)
 {
 #ifdef HAVE_STRFTIME
-	struct tm *tp;
-	char buf[80];
+  struct tm *tp;
+  char buf[80];
 
-	tp = gmtime (&date);
-	if (NULL == tp) {
-		(void) printf ("time_t: %lu\n", date);
-	} else {
-		(void) strftime (buf, sizeof buf, "%b %d, %Y", tp);
-		(void) puts (buf);
-	}
+  tp = gmtime (&date);
+  strftime (buf, sizeof buf, "%b %d, %Y", tp);
+  puts (buf);
 #else
-	struct tm *tp;
-	char *cp = NULL;
+  struct tm *tp;
+  char *cp;
 
-	tp = gmtime (&date);
-	if (NULL != tp) {
-		cp = asctime (tp);
-	}
-	if (NULL != cp) {
-		(void) printf ("%6.6s, %4.4s\n", cp + 4, cp + 20);
-	} else {
-		(void) printf ("time_t: %lu\n", date);
-	}
+  tp = gmtime (&date);
+  cp = asctime (tp);
+  printf ("%6.6s, %4.4s\n", cp + 4, cp + 20);
 #endif
 }
 
-/*
- * list_fields - display the current values of the expiration fields
- *
- * display the password age information from the password fields. Date
- * values will be displayed as a calendar date, or the word "never" if
- * the date is 1/1/70, which is day number 0.
- */
-static void list_fields (void)
+/* Print the current values of the expiration fields.  */
+static void
+print_shadow_info (user_t *data)
 {
-	long changed = 0;
-	long expires;
-
-	/*
-	 * The "last change" date is either "never" or the date the password
-	 * was last modified. The date is the number of days since 1/1/1970.
-	 */
-	(void) fputs (_("Last password change\t\t\t\t\t: "), stdout);
-	if (lstchgdate < 0) {
-		(void) puts (_("never"));
-	} else if (lstchgdate == 0) {
-		(void) puts (_("password must be changed"));
-	} else {
-		changed = lstchgdate * SCALE;
-		print_date ((time_t) changed);
-	}
-
-	/*
-	 * The password expiration date is determined from the last change
-	 * date plus the number of days the password is valid for.
-	 */
-	(void) fputs (_("Password expires\t\t\t\t\t: "), stdout);
-	if (lstchgdate == 0) {
-		(void) puts (_("password must be changed"));
-	} else if (   (lstchgdate < 0)
-	           || (maxdays >= (10000 * (DAY / SCALE)))
-	           || (maxdays < 0)) {
-		(void) puts (_("never"));
-	} else {
-		expires = changed + maxdays * SCALE;
-		print_date ((time_t) expires);
-	}
-
-	/*
-	 * The account becomes inactive if the password is expired for more
-	 * than "inactdays". The expiration date is calculated and the
-	 * number of inactive days is added. The resulting date is when the
-	 * active will be disabled.
-	 */
-	(void) fputs (_("Password inactive\t\t\t\t\t: "), stdout);
-	if (lstchgdate == 0) {
-		(void) puts (_("password must be changed"));
-	} else if (   (lstchgdate < 0)
-	           || (inactdays < 0)
-	           || (maxdays >= (10000 * (DAY / SCALE)))
-	           || (maxdays < 0)) {
-		(void) puts (_("never"));
-	} else {
-		expires = changed + (maxdays + inactdays) * SCALE;
-		print_date ((time_t) expires);
-	}
-
-	/*
-	 * The account will expire on the given date regardless of the
-	 * password expiring or not.
-	 */
-	(void) fputs (_("Account expires\t\t\t\t\t\t: "), stdout);
-	if (expdate < 0) {
-		(void) puts (_("never"));
-	} else {
-		expires = expdate * SCALE;
-		print_date ((time_t) expires);
-	}
-
-	/*
-	 * Start with the easy numbers - the number of days before the
-	 * password can be changed, the number of days after which the
-	 * password must be chaged, the number of days before the password
-	 * expires that the user is told, and the number of days after the
-	 * password expires that the account becomes unusable.
-	 */
-	printf (_("Minimum number of days between password change\t\t: %ld\n"),
-	        mindays);
-	printf (_("Maximum number of days between password change\t\t: %ld\n"),
-	        maxdays);
-	printf (_("Number of days of warning before password expires\t: %ld\n"),
-	        warndays);
+  printf (_("Minimum:\t%ld\n"), data->sp.sp_min);
+  printf (_("Maximum:\t%ld\n"), data->sp.sp_max);
+  printf (_("Warning:\t%ld\n"), data->sp.sp_warn);
+  printf (_("Inactive:\t%ld\n"), data->sp.sp_inact);
+  printf (_("Last Change:\t\t"));
+  if (data->sp.sp_lstchg == 0)
+    printf (_("Unknown, password is forced to change at next login\n"));
+  else if (data->sp.sp_lstchg < 0)
+    printf (_("Never\n"));
+  else
+    print_date (data->sp.sp_lstchg * SCALE);
+  printf (_("Password Expires:\t"));
+  if (data->sp.sp_lstchg <= 0 || data->sp.sp_max >= 10000 * (DAY / SCALE)
+      || data->sp.sp_max < 0)
+    printf (_("Never\n"));
+  else
+    print_date (data->sp.sp_lstchg * SCALE + data->sp.sp_max * SCALE);
+  printf (_("Password Inactive:\t"));
+  if (data->sp.sp_lstchg <= 0 || data->sp.sp_inact < 0 ||
+      data->sp.sp_max >= 10000 * (DAY / SCALE) || data->sp.sp_max < 0)
+    printf (_("Never\n"));
+  else
+    print_date (data->sp.sp_lstchg * SCALE +
+		(data->sp.sp_max + data->sp.sp_inact) * SCALE);
+  printf (_("Account Expires:\t"));
+  if (data->sp.sp_expire < 0)
+    printf (_("Never\n"));
+  else
+    print_date (data->sp.sp_expire * SCALE);
 }
 
-/*
- * process_flags - parse the command line options
- *
- *	It will not return if an error is encountered.
- */
-static void process_flags (int argc, char **argv)
+static int
+change_shadow_info (user_t *data)
 {
-	/*
-	 * Parse the command line options.
-	 */
-	int option_index = 0;
-	int c;
-	static struct option long_options[] = {
-		{"lastday", required_argument, NULL, 'd'},
-		{"expiredate", required_argument, NULL, 'E'},
-		{"help", no_argument, NULL, 'h'},
-		{"inactive", required_argument, NULL, 'I'},
-		{"list", no_argument, NULL, 'l'},
-		{"mindays", required_argument, NULL, 'm'},
-		{"maxdays", required_argument, NULL, 'M'},
-		{"warndays", required_argument, NULL, 'W'},
-		{NULL, 0, NULL, '\0'}
-	};
+  char *buf, *res, *cp;
 
-	while ((c =
-		getopt_long (argc, argv, "d:E:hI:lm:M:W:", long_options,
-			     &option_index)) != -1) {
-		switch (c) {
-		case 'd':
-			dflg = true;
-			if (!isnum (optarg)) {
-				lstchgdate = strtoday (optarg);
-			} else if (   (getlong (optarg, &lstchgdate) == 0)
-			           || (lstchgdate < -1)) {
-				fprintf (stderr,
-				         _("%s: invalid date '%s'\n"),
-				         Prog, optarg);
-				usage ();
-			}
-			break;
-		case 'E':
-			Eflg = true;
-			if (!isnum (optarg)) {
-				expdate = strtoday (optarg);
-			} else if (   (getlong (optarg, &expdate) == 0)
-			           || (expdate < -1)) {
-				fprintf (stderr,
-				         _("%s: invalid date '%s'\n"),
-				         Prog, optarg);
-				usage ();
-			}
-			break;
-		case 'h':
-			usage ();
-			break;
-		case 'I':
-			Iflg = true;
-			if (   (getlong (optarg, &inactdays) == 0)
-			    || (inactdays < -1)) {
-				fprintf (stderr,
-				         _("%s: invalid numeric argument '%s'\n"),
-				         Prog, optarg);
-				usage ();
-			}
-			break;
-		case 'l':
-			lflg = true;
-			break;
-		case 'm':
-			mflg = true;
-			if (   (getlong (optarg, &mindays) == 0)
-			    || (mindays < -1)) {
-				fprintf (stderr,
-				         _("%s: invalid numeric argument '%s'\n"),
-				         Prog, optarg);
-				usage ();
-			}
-			break;
-		case 'M':
-			Mflg = true;
-			if (   (getlong (optarg, &maxdays) == 0)
-			    || (maxdays < -1)) {
-				fprintf (stderr,
-				         _("%s: invalid numeric argument '%s'\n"),
-				         Prog, optarg);
-				usage ();
-			}
-			break;
-		case 'W':
-			Wflg = true;
-			if (   (getlong (optarg, &warndays) == 0)
-			    || (warndays < -1)) {
-				fprintf (stderr,
-				         _("%s: invalid numeric argument '%s'\n"),
-				         Prog, optarg);
-				usage ();
-			}
-			break;
-		default:
-			usage ();
-		}
+  if (asprintf (&buf, "%ld", data->sp.sp_min) < 0)
+    return E_FAILURE;
+  res = get_value (buf, _("Minimum Password Age"));
+  free (buf);
+  if (res == NULL ||
+      ((data->spn.sp_min = strtol (res, &cp, 10)) == 0 && *cp) ||
+      data->spn.sp_min < -1)
+    {
+      if (cp && *cp)
+	fprintf (stderr, _("Input is no integer value\n"));
+      else
+	fprintf (stderr, _("Negative numbers are not allowed as input (except -1)\n"));
+      return E_FAILURE;
+    }
+  free (res);
+
+  if (asprintf (&buf, "%ld", data->sp.sp_max) < 0)
+    return E_FAILURE;
+  res = get_value (buf, _("Maximum Password Age"));
+  free (buf);
+  if (res == NULL ||
+      ((data->spn.sp_max = strtol (res, &cp, 10)) == 0 && *cp) ||
+      data->spn.sp_max < -1)
+    {
+      if (cp && *cp)
+	fprintf (stderr, _("Input is no integer value\n"));
+      else
+	fprintf (stderr, _("Negative numbers are not allowed as input (except -1)\n"));
+      return E_FAILURE;
+    }
+  free (res);
+
+  if (asprintf (&buf, "%ld", data->sp.sp_warn) < 0)
+    return E_FAILURE;
+  res = get_value (buf, _("Password Expiration Warning"));
+  free (buf);
+  if (res == NULL ||
+      ((data->spn.sp_warn = strtol (res, &cp, 10)) == 0 && *cp) ||
+      data->spn.sp_warn < -1)
+    {
+      if (cp && *cp)
+	fprintf (stderr, _("Input is no integer value\n"));
+      else
+	fprintf (stderr, _("Negative numbers are not allowed as input (except -1)\n"));
+      return E_FAILURE;
+    }
+  free (res);
+
+  if (asprintf (&buf, "%ld", data->sp.sp_inact) < 0)
+    return E_FAILURE;
+  res = get_value (buf, _("Password Inactive"));
+  free (buf);
+  if (res == NULL ||
+      ((data->spn.sp_inact = strtol (res, &cp, 10)) == 0 && *cp) ||
+      data->spn.sp_inact < -1)
+    return E_FAILURE;
+
+  buf = date2str (data->sp.sp_lstchg * SCALE);
+  res = get_value (buf, _("Last Password Change (YYYY-MM-DD)"));
+  free (buf);
+  if (res == NULL)
+    return E_FAILURE;
+  else if (strcmp (res, "1969-12-31") == 0 ||
+	   strcmp (res, "0") == 0 ||
+	   strcmp (res, "-1") == 0)
+    data->sp.sp_lstchg = -1;
+  else
+    {
+      data->spn.sp_lstchg = str2date (res);
+      free (res);
+      if (data->spn.sp_lstchg == -1)
+	{
+	  fprintf (stderr, _("Invalid date\n"));
+	  return E_FAILURE;
 	}
+    }
 
-	check_flags (argc, optind);
+  buf = date2str (data->sp.sp_expire * SCALE);
+  res = get_value (buf, _("Account Expiration Date (YYYY-MM-DD)"));
+  free (buf);
+  if (res == NULL)
+    return E_FAILURE;
+  else if (strcmp (res, "1969-12-31") == 0 ||
+	   strcmp (res, "0") == 0 ||
+	   strcmp (res, "-1") == 0)
+    data->spn.sp_expire = -1;
+  else
+    {
+      data->spn.sp_expire = str2date (res);
+      free (res);
+      if (data->spn.sp_expire == -1)
+	{
+	  fprintf (stderr, _("Invalid date\n"));
+	  return E_FAILURE;
+	}
+    }
+  return 0;
 }
 
-/*
- * check_flags - check flags and parameters consistency
- *
- *	It will not return if an error is encountered.
- */
-static void check_flags (int argc, int opt_index)
+int
+main (int argc, char *argv[])
 {
-	/*
-	 * Make certain the flags do not conflict and that there is a user
-	 * name on the command line.
-	 */
-
-	if (argc != opt_index + 1) {
-		usage ();
-	}
-
-	if (lflg && (mflg || Mflg || dflg || Wflg || Iflg || Eflg)) {
-		fprintf (stderr,
-		         _("%s: do not include \"l\" with other flags\n"),
-		         Prog);
-		usage ();
-	}
-}
-
-/*
- * check_perms - check if the caller is allowed to add a group
- *
- *	Non-root users are only allowed to display their aging information.
- *	(we will later make sure that the user is only listing her aging
- *	information)
- *
- *	With PAM support, the setuid bit can be set on chage to allow
- *	non-root users to groups.
- *	Without PAM support, only users who can write in the group databases
- *	can add groups.
- *
- *	It will not return if the user is not allowed.
- */
-static void check_perms (void)
-{
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-	pam_handle_t *pamh = NULL;
-	struct passwd *pampw;
-	int retval;
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
-
-	/*
-	 * An unprivileged user can ask for their own aging information, but
-	 * only root can change it, or list another user's aging
-	 * information.
-	 */
-
-	if (!amroot && !lflg) {
-		fprintf (stderr, _("%s: Permission denied.\n"), Prog);
-		fail_exit (E_NOPERM);
-	}
-
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-	pampw = getpwuid (getuid ()); /* local, no need for xgetpwuid */
-	if (NULL == pampw) {
-		fprintf (stderr,
-		         _("%s: Cannot determine your user name.\n"),
-		         Prog);
-		exit (E_NOPERM);
-	}
-
-	retval = pam_start ("chage", pampw->pw_name, &conv, &pamh);
-
-	if (PAM_SUCCESS == retval) {
-		retval = pam_authenticate (pamh, 0);
-	}
-
-	if (PAM_SUCCESS == retval) {
-		retval = pam_acct_mgmt (pamh, 0);
-	}
-
-	if (NULL != pamh) {
-		(void) pam_end (pamh, retval);
-	}
-	if (PAM_SUCCESS != retval) {
-		fprintf (stderr, _("%s: PAM authentication failed\n"), Prog);
-		fail_exit (E_NOPERM);
-	}
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
-}
-
-/*
- * open_files - open the shadow database
- *
- *	In read-only mode, the databases are not locked and are opened
- *	only for reading.
- */
-static void open_files (bool readonly)
-{
-	/*
-	 * Lock and open the password file. This loads all of the password
-	 * file entries into memory. Then we get a pointer to the password
-	 * file entry for the requested user.
-	 */
-	if (!readonly) {
-		if (pw_lock () == 0) {
-			fprintf (stderr,
-			         _("%s: cannot lock %s; try again later.\n"),
-			         Prog, pw_dbname ());
-			fail_exit (E_NOPERM);
-		}
-		pw_locked = true;
-	}
-	if (pw_open (readonly ? O_RDONLY: O_RDWR) == 0) {
-		fprintf (stderr, _("%s: cannot open %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_WARN, "cannot open %s", pw_dbname ()));
-		fail_exit (E_NOPERM);
-	}
-
-	/*
-	 * For shadow password files we have to lock the file and read in
-	 * the entries as was done for the password file. The user entries
-	 * does not have to exist in this case; a new entry will be created
-	 * for this user if one does not exist already.
-	 */
-	if (!readonly) {
-		if (spw_lock () == 0) {
-			fprintf (stderr,
-			         _("%s: cannot lock %s; try again later.\n"),
-			         Prog, spw_dbname ());
-			fail_exit (E_NOPERM);
-		}
-		spw_locked = true;
-	}
-	if (spw_open (readonly ? O_RDONLY: O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"), Prog, spw_dbname ());
-		SYSLOG ((LOG_WARN, "cannot open %s", spw_dbname ()));
-		fail_exit (E_NOPERM);
-	}
-}
-
-/*
- * close_files - close and unlock the password/shadow databases
- */
-static void close_files (void)
-{
-	/*
-	 * Now close the shadow password file, which will cause all of the
-	 * entries to be re-written.
-	 */
-	if (spw_close () == 0) {
-		fprintf (stderr,
-		         _("%s: failure while writing changes to %s\n"), Prog, spw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", spw_dbname ()));
-		fail_exit (E_NOPERM);
-	}
-
-	/*
-	 * Close the password file. If any entries were modified, the file
-	 * will be re-written.
-	 */
-	if (pw_close () == 0) {
-		fprintf (stderr, _("%s: failure while writing changes to %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", pw_dbname ()));
-		fail_exit (E_NOPERM);
-	}
-	if (spw_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-		/* continue */
-	}
-	spw_locked = false;
-	if (pw_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-		/* continue */
-	}
-	pw_locked = false;
-}
-
-/*
- * update_age - update the aging information in the database
- *
- *	It will not return in case of error
- */
-static void update_age (const struct spwd *sp, const struct passwd *pw)
-{
-	struct spwd spwent;
-
-	/*
-	 * There was no shadow entry. The new entry will have the encrypted
-	 * password transferred from the normal password file along with the
-	 * aging information.
-	 */
-	if (NULL == sp) {
-		struct passwd pwent = *pw;
-
-		memzero (&spwent, sizeof spwent);
-		spwent.sp_namp = xstrdup (pw->pw_name);
-		spwent.sp_pwdp = xstrdup (pw->pw_passwd);
-		spwent.sp_flag = SHADOW_SP_FLAG_UNSET;
-
-		pwent.pw_passwd = SHADOW_PASSWD_STRING;	/* XXX warning: const */
-		if (pw_update (&pwent) == 0) {
-			fprintf (stderr,
-			         _("%s: failed to prepare the new %s entry '%s'\n"), Prog, pw_dbname (), pwent.pw_name);
-			fail_exit (E_NOPERM);
-		}
-	} else {
-		spwent.sp_namp = xstrdup (sp->sp_namp);
-		spwent.sp_pwdp = xstrdup (sp->sp_pwdp);
-		spwent.sp_flag = sp->sp_flag;
-	}
-
-	/*
-	 * Copy the fields back to the shadow file entry and write the
-	 * modified entry back to the shadow file. Closing the shadow and
-	 * password files will commit any changes that have been made.
-	 */
-	spwent.sp_max = maxdays;
-	spwent.sp_min = mindays;
-	spwent.sp_lstchg = lstchgdate;
-	spwent.sp_warn = warndays;
-	spwent.sp_inact = inactdays;
-	spwent.sp_expire = expdate;
-
-	if (spw_update (&spwent) == 0) {
-		fprintf (stderr,
-		         _("%s: failed to prepare the new %s entry '%s'\n"), Prog, spw_dbname (), spwent.sp_namp);
-		fail_exit (E_NOPERM);
-	}
-
-}
-
-/*
- * get_defaults - get the value of the fields not set from the command line
- */
-static void get_defaults (const struct spwd *sp)
-{
-	/*
-	 * Set the fields that aren't being set from the command line from
-	 * the password file.
-	 */
-	if (NULL != sp) {
-		if (!Mflg) {
-			maxdays = sp->sp_max;
-		}
-		if (!mflg) {
-			mindays = sp->sp_min;
-		}
-		if (!dflg) {
-			lstchgdate = sp->sp_lstchg;
-		}
-		if (!Wflg) {
-			warndays = sp->sp_warn;
-		}
-		if (!Iflg) {
-			inactdays = sp->sp_inact;
-		}
-		if (!Eflg) {
-			expdate = sp->sp_expire;
-		}
-	} else {
-		/*
-		 * Use default values that will not change the behavior of the
-		 * account.
-		 */
-		if (!Mflg) {
-			maxdays = -1;
-		}
-		if (!mflg) {
-			mindays = -1;
-		}
-		if (!dflg) {
-			lstchgdate = -1;
-		}
-		if (!Wflg) {
-			warndays = -1;
-		}
-		if (!Iflg) {
-			inactdays = -1;
-		}
-		if (!Eflg) {
-			expdate = -1;
-		}
-	}
-}
-
-/*
- * chage - change a user's password aging information
- *
- *	This command controls the password aging information.
- *
- *	The valid options are
- *
- *	-d	set last password change date (*)
- *	-E	set account expiration date (*)
- *	-I	set password inactive after expiration (*)
- *	-l	show account aging information
- *	-M	set maximim number of days before password change (*)
- *	-m	set minimum number of days before password change (*)
- *	-W	set expiration warning days (*)
- *
- *	(*) requires root permission to execute.
- *
- *	All of the time fields are entered in the internal format which is
- *	either seconds or days.
- */
-
-int main (int argc, char **argv)
-{
-	const struct spwd *sp;
-	uid_t ruid;
-	gid_t rgid;
-	const struct passwd *pw;
-
-#ifdef WITH_AUDIT
-	audit_help_open ();
+  const char *program = "chage";
+  uid_t uid = getuid ();
+  user_t *pw_data = NULL;
+  char *use_service = NULL;
+  char *caller_name = NULL;
+  char *mindays = NULL, *maxdays = NULL, *lastday = NULL, *inactive = NULL;
+  char *expiredate = NULL, *warndays = NULL;
+#ifdef USE_LDAP
+  char *binddn = NULL;
 #endif
-	sanitize_env ();
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
+  int interactive = 1;
+  int silent = 0;
+  int l_flag = 0;
 
-	ruid = getuid ();
-	rgid = getgid ();
-	amroot = (ruid == 0);
-#ifdef WITH_SELINUX
-	if (amroot && (is_selinux_enabled () > 0)) {
-		amroot = (selinux_check_passwd_access (PASSWD__ROOTOK) == 0);
-	}
+#ifdef ENABLE_NLS
+  setlocale(LC_ALL, "");
+  bindtextdomain(PACKAGE, LOCALEDIR);
+  textdomain(PACKAGE);
 #endif
 
-	/*
-	 * Get the program name so that error messages can use it.
-	 */
-	Prog = Basename (argv[0]);
+  open_sec_log(program);
 
-	process_flags (argc, argv);
+  /* Before going any further, raise the ulimit and ignore
+     signals.  */
+  init_environment ();
 
-	OPENLOG ("chage");
-
-	check_perms ();
-
-	if (!spw_file_present ()) {
-		fprintf (stderr,
-		         _("%s: the shadow password file is not present\n"),
-		         Prog);
-		SYSLOG ((LOG_WARN, "can't find the shadow password file"));
-		closelog ();
-		exit (E_SHADOW_NOTFOUND);
-	}
-
-	open_files (lflg);
-	/* Drop privileges */
-	if (lflg && (   (setregid (rgid, rgid) != 0)
-	             || (setreuid (ruid, ruid) != 0))) {
-		fprintf (stderr, _("%s: failed to drop privileges (%s)\n"),
-		         Prog, strerror (errno));
-		fail_exit (E_NOPERM);
-	}
-
-	pw = pw_locate (argv[optind]);
-	if (NULL == pw) {
-		fprintf (stderr, _("%s: user '%s' does not exist in %s\n"),
-		         Prog, argv[optind], pw_dbname ());
-		closelog ();
-		exit (E_NOPERM);
-	}
-
-	STRFCPY (user_name, pw->pw_name);
-	user_uid = pw->pw_uid;
-
-	sp = spw_locate (argv[optind]);
-	get_defaults(sp);
-
-	/*
-	 * Print out the expiration fields if the user has requested the
-	 * list option.
-	 */
-	if (lflg) {
-		if (!amroot && (ruid != user_uid)) {
-			fprintf (stderr, _("%s: Permission denied.\n"), Prog);
-			fail_exit (E_NOPERM);
-		}
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-		              "display aging info",
-		              user_name, (unsigned int) user_uid, 1);
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+      static struct option long_options[] = {
+	{"mindays",    required_argument, NULL, 'm' },
+	{"maxdays",    required_argument, NULL, 'M' },
+	{"lastday",    required_argument, NULL, 'd' },
+	{"inactive",   required_argument, NULL, 'I' },
+	{"expiredate", required_argument, NULL, 'E' },
+	{"warndays",   required_argument, NULL, 'W' },
+	{"list",       no_argument,       NULL, 'l' },
+#ifdef USE_LDAP
+	{"binddn",     required_argument, NULL, 'D' },
 #endif
-		list_fields ();
-		fail_exit (E_SUCCESS);
+	{"quiet",      no_argument,       NULL, 'q' },
+	{"path",       required_argument, NULL, 'P' },
+	{"version",    no_argument,       NULL, 'v' },
+	{"usage",      no_argument,       NULL, 'u' },
+	{"service",    required_argument, NULL, '\254' },
+	{"help",       no_argument,       NULL, '\255' },
+	{NULL,         0,                 NULL, '\0'}
+      };
+
+      c = getopt_long (argc, argv, "lm:M:d:D:I:E:W:P:vuq",
+		       long_options, &option_index);
+      if (c == (-1))
+        break;
+      switch (c)
+        {
+	case 'm':
+	  mindays = optarg;
+	  interactive = 0;
+	  break;
+	case 'M':
+	  maxdays = optarg;
+	  interactive = 0;
+	  break;
+	case 'd':
+	  lastday = optarg;
+	  interactive = 0;
+	  break;
+	case 'I':
+	  inactive = optarg;
+	  interactive = 0;
+	  break;
+	case 'E':
+	  expiredate = optarg;
+	  interactive = 0;
+	  break;
+	case 'W':
+	  warndays = optarg;
+	  interactive = 0;
+	  break;
+#ifdef USE_LDAP
+	case 'D':
+	  binddn = optarg;
+	  break;
+#endif
+	case 'l':
+	  l_flag = 1;
+	  break;
+	case 'P':
+	  if (uid != 0)
+	    {
+	      sec_log (program, MSG_PATH_ARG_DENIED, uid);
+	      fprintf (stderr,
+		       _("Only root is allowed to specify another path\n"));
+	      return E_NOPERM;
+	    }
+	  else
+	    files_etc_dir = strdup (optarg);
+	  break;
+	case 'q':
+	  silent = 1;
+	  break;
+	case '\254':
+	  if (use_service != NULL)
+	    {
+	      print_usage (stderr, program);
+	      return E_BAD_ARG;
+	    }
+
+	  if (strcasecmp (optarg, "yp") == 0 ||
+	      strcasecmp (optarg, "nis") == 0)
+	    use_service = "nis";
+	  else if (strcasecmp (optarg, "nis+") == 0 ||
+		   strcasecmp (optarg, "nisplus") == 0)
+	    use_service = "nisplus";
+	  else if (strcasecmp (optarg, "files") == 0)
+	    use_service = "files";
+#ifdef USE_LDAP
+	  else if (strcasecmp (optarg, "ldap") == 0)
+	    use_service = "ldap";
+#endif
+	  else
+	    {
+	      fprintf (stderr, _("Service `%s' not supported.\n"), optarg);
+	      print_usage (stderr, program);
+	      return E_BAD_ARG;
+	    }
+	  break;
+        case '\255':
+          print_help (program);
+          return 0;
+        case 'v':
+          print_version (program, "2008");
+          return 0;
+        case 'u':
+          print_usage (stdout, program);
+          return 0;
+        default:
+          print_error (program);
+          return E_USAGE;
+        }
+    }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc > 1)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+
+  if (l_flag && !interactive)
+    {
+      fprintf (stderr, _("%s: Do not include \"l\" with other flags\n"),
+	       program);
+      print_usage (stderr, program);
+      return E_USAGE;
+    }
+  else
+    {
+      int buflen = 256;
+      char *buffer = alloca (buflen);
+      struct passwd resultbuf;
+      struct passwd *pw;
+      char *arg_user;
+
+      /* Determine our own user name for authentication.  */
+      while (getpwuid_r (uid, &resultbuf, buffer, buflen, &pw) != 0
+	     && errno == ERANGE)
+	{
+	  errno = 0;
+	  buflen += 256;
+	  buffer = alloca (buflen);
 	}
 
-	/*
-	 * If none of the fields were changed from the command line, let the
-	 * user interactively change them.
-	 */
-	if (!mflg && !Mflg && !dflg && !Wflg && !Iflg && !Eflg) {
-		printf (_("Changing the aging information for %s\n"),
-		        user_name);
-		if (new_fields () == 0) {
-			fprintf (stderr, _("%s: error changing fields\n"),
-			         Prog);
-			fail_exit (E_NOPERM);
-		}
-#ifdef WITH_AUDIT
-		else {
-			audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-			              "change all aging information",
-			              user_name, (unsigned int) user_uid, 1);
-		}
-#endif
-	} else {
-#ifdef WITH_AUDIT
-		if (Mflg) {
-			audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-			              "change max age",
-			              user_name, (unsigned int) user_uid, 1);
-		}
-		if (mflg) {
-			audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-			              "change min age",
-			              user_name, (unsigned int) user_uid, 1);
-		}
-		if (dflg) {
-			audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-			              "change last change date",
-			              user_name, (unsigned int) user_uid, 1);
-		}
-		if (Wflg) {
-			audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-			              "change passwd warning",
-			              user_name, (unsigned int) user_uid, 1);
-		}
-		if (Iflg) {
-			audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-			              "change inactive days",
-			              user_name, (unsigned int) user_uid, 1);
-		}
-		if (Eflg) {
-			audit_logger (AUDIT_USER_CHAUTHTOK, Prog,
-			              "change passwd expiration",
-			              user_name, (unsigned int) user_uid, 1);
-		}
-#endif
+      if (!pw)
+	{
+	  sec_log (program, MSG_NO_ACCOUNT_FOUND, uid);
+	  fprintf (stderr, _("%s: Cannot determine your user name.\n"),
+		   program);
+	  return E_UNKNOWN_USER;
 	}
 
-	update_age (sp, pw);
+      caller_name = strdupa (pw->pw_name);
 
-	close_files ();
+      /* if we show/modify the data for another user, get the data from
+	 this one.  */
+      if (argc == 1)
+	arg_user = locale_to_utf8 (argv[0]);
+      else
+	arg_user = pw->pw_name;
 
-	SYSLOG ((LOG_INFO, "changed password expiry for %s", user_name));
+      pw_data = do_getpwnam (arg_user, use_service);
+      if (pw_data == NULL || pw_data->service == S_NONE)
+	{
+	  if (use_service)
+	    fprintf (stderr,
+		     _("%s: User `%s' is not known to service `%s'.\n"),
+		     program, utf8_to_locale (arg_user), use_service);
+	  else
+	    fprintf (stderr, _("%s: Unknown user `%s'.\n"), program,
+		     utf8_to_locale (arg_user));
+	  return E_UNKNOWN_USER;
+	}
+    }
 
-	closelog ();
-	exit (E_SUCCESS);
+  if (!l_flag)
+    {
+      /* Only root is allowed to change aging for local users. */
+      if (uid && (pw_data->service == S_LOCAL
+#ifdef USE_LDAP
+		  || (pw_data->service == S_LDAP && binddn == NULL)
+#endif
+		  ))
+	{
+	  sec_log (program, MSG_PERMISSION_DENIED,
+		   pw_data->pw.pw_name, pw_data->pw.pw_uid, uid);
+	  fprintf (stderr,
+		   _("Only an administrator is allowed to change aging information.\n"));
+	  free_user_t (pw_data);
+	  return E_NOPERM;
+	}
+
+      /* If no shadow entry exist for this account, check if we can
+	 create them.  */
+      if (!pw_data->use_shadow)
+	{
+	  char shadowfile[strlen (files_etc_dir) + 8];
+	  char *cp = stpcpy (shadowfile, files_etc_dir);
+	  strcpy (cp, "/shadow");
+
+	  if (access (shadowfile, F_OK) != 0)
+	    {
+	      fprintf (stderr,
+		       _("This system does not support shadow accounts.\n"));
+	      return E_MISSING;
+	    }
+	  else if (pw_data->service != S_LOCAL)
+	    {
+	      fprintf (stderr,
+		       _("This account does not have a shadow entry.\n"));
+	      return E_MISSING;
+	    }
+	  else
+	    {
+	      /* Initialize data with dummy values. */
+	      pw_data->sp.sp_lstchg = -1;
+	      pw_data->sp.sp_min = -1;
+	      pw_data->sp.sp_max = -1;
+	      pw_data->sp.sp_warn = -1;
+	      pw_data->sp.sp_inact = -1;
+	      pw_data->sp.sp_expire = -1;
+	      pw_data->sp.sp_flag = -1;
+	    }
+	}
+    }
+
+#ifdef USE_LDAP
+  if (binddn && pw_data->service == S_LDAP)
+    pw_data->oldclearpwd = strdup (get_ldap_password (binddn));
+  else
+#endif /* USE_LDAP */
+    if (do_authentication (program, caller_name, pw_data) != 0)
+      {
+	sec_log (program, MSG_PERMISSION_DENIED,
+		 pw_data->pw.pw_name, pw_data->pw.pw_uid, uid);
+	free_user_t (pw_data);
+	return E_NOPERM;
+      }
+  /* We don't need to extra ask for a password with "-l" and if the
+     password is stored in the local file.  */
+    else if (!l_flag && pw_data->service != S_LOCAL)
+      if (get_old_clear_password (pw_data) != 0)
+	{
+	  free_user_t (pw_data);
+	  return E_FAILURE;
+	}
+
+  if (l_flag)
+    {
+      if (uid != 0 && pw_data->service != S_LDAP &&
+	  strcmp (caller_name, pw_data->pw.pw_name) != 0)
+	{
+	  sec_log (program, MSG_PERMISSION_DENIED,
+		   pw_data->pw.pw_name, pw_data->pw.pw_uid, uid);
+	  fprintf (stderr,
+		   _("You can only list your own aging information.\n"));
+	  return E_NOPERM;
+	}
+
+      if (setgid (getgid ()) || setuid (uid))
+	{
+	  sec_log (program, MSG_DROP_PRIVILEGE_FAILED, errno, uid);
+	  fprintf (stderr, _("%s: Failed to drop privileges: %s\n"),
+		   program, strerror (errno));
+	  return E_FAILURE;
+        }
+
+      if (pw_data->use_shadow)
+	{
+	  sec_log (program, MSG_SHADOW_DATA_PRINTED,
+		   pw_data->pw.pw_name, pw_data->pw.pw_uid, uid);
+	  print_shadow_info (pw_data);
+	}
+      else
+	fprintf (stdout, _("No aging information available for %s.\n"),
+		 utf8_to_locale (pw_data->pw.pw_name));
+
+      return 0;
+    }
+
+  /* Caller must be root or he needs to know the binddn and password
+     for LDAP administrator.  */
+  if (uid != 0
+#ifdef USE_LDAP
+      && !(binddn && pw_data->service == S_LDAP)
+#endif
+      )
+    return E_USAGE;
+
+  if (interactive)
+    {
+      int res;
+
+      if (!silent)
+	printf (_("Changing aging information for %s.\n"),
+		utf8_to_locale (pw_data->pw.pw_name));
+
+      if ((res = change_shadow_info (pw_data)) != 0)
+	{
+	  if (!silent)
+	    printf (_("Aging information not changed.\n"));
+	  return E_FAILURE;
+	}
+    }
+  else
+    {
+      char *cp;
+      int error = 0;
+
+      if (mindays)
+	if (((pw_data->spn.sp_min = strtol (mindays, &cp, 10)) == 0 && *cp) ||
+	    pw_data->spn.sp_min < -1)
+	  ++error;
+
+      if (maxdays)
+	if (((pw_data->spn.sp_max = strtol (maxdays, &cp, 10)) == 0 && *cp) ||
+	    pw_data->spn.sp_max < -1)
+	  ++error;
+
+      if (warndays)
+	if (((pw_data->spn.sp_warn = strtol (warndays, &cp, 10)) == 0 && *cp)
+	    || pw_data->spn.sp_warn < -1)
+	  ++error;
+
+      if (inactive)
+	if (((pw_data->spn.sp_inact = strtol (inactive, &cp, 10)) == 0 && *cp)
+	    || pw_data->spn.sp_inact < -1)
+	  ++error;
+
+      if (lastday)
+	{
+	  if (strcmp (lastday, "1969-12-31") == 0)
+	    pw_data->sp.sp_lstchg = -1;
+	  else
+	    {
+	      pw_data->spn.sp_lstchg = str2date (lastday);
+	      if (pw_data->spn.sp_lstchg == -1)
+		{
+		  if (((pw_data->spn.sp_lstchg =
+			strtol (lastday, &cp, 10)) == 0 && *cp) ||
+		      pw_data->spn.sp_lstchg < -1)
+		    {
+		      fprintf (stderr,
+			_("Lastday is no date and no integer value >= -1\n"));
+		      ++error;
+		    }
+		}
+	    }
+	}
+
+      if (expiredate)
+	{
+	  if (strcmp (expiredate, "1969-12-31") == 0)
+	    pw_data->spn.sp_expire = -1;
+	  else
+	    {
+	      pw_data->spn.sp_expire = str2date (expiredate);
+	      if (pw_data->spn.sp_expire == -1)
+		{
+		  if (((pw_data->spn.sp_expire =
+			strtol (expiredate, &cp, 10)) == 0 && *cp) ||
+		      pw_data->spn.sp_expire < -1)
+		    {
+		      fprintf (stderr, _("Expiredate is no date and no integer value >= -1\n"));
+		      ++error;
+		    }
+		}
+	    }
+	}
+      if (error)
+	{
+	  if (!silent)
+	    fprintf (stderr, _("Error while parsing options.\n"));
+	  free_user_t (pw_data);
+	  return E_BAD_ARG;
+	}
+    }
+
+  /* we don't need to change the data if there is no change */
+  if (pw_data->sp.sp_min == pw_data->spn.sp_min &&
+      pw_data->sp.sp_max == pw_data->spn.sp_max &&
+      pw_data->sp.sp_warn == pw_data->spn.sp_warn &&
+      pw_data->sp.sp_inact == pw_data->spn.sp_inact &&
+      pw_data->sp.sp_lstchg == pw_data->spn.sp_lstchg &&
+      pw_data->sp.sp_expire == pw_data->spn.sp_expire)
+    {
+      if (!silent)
+	printf (_("Aging information not changed.\n"));
+      return 0;
+    }
+  else
+    {
+      pw_data->sp_changed = TRUE;
+      pw_data->todo = DO_MODIFY;
+    }
+
+#ifdef USE_LDAP
+  if (binddn)
+    pw_data->binddn = strdup (binddn);
+#endif
+
+  /* We have a shadow file, but this user does not have
+     a shadow entry. Create one.  */
+  if (!pw_data->use_shadow)
+    {
+      int rc;
+
+      /* Backup original password and replace it with a "x"
+	 in local files. Report error*/
+      pw_data->todo = DO_MODIFY;
+      pw_data->sp.sp_pwdp = pw_data->pw.pw_passwd;
+      pw_data->newpassword = "x";
+      rc = write_user_data (pw_data, 0);
+      pw_data->newpassword = NULL;
+
+      if (rc != 0)
+	{
+	  fprintf (stderr,
+		   _("Error while converting to shadow account.\n"));
+	  free_user_t (pw_data);
+	  return E_FAILURE;
+	}
+
+      pw_data->use_shadow = 1;
+      pw_data->todo = DO_CREATE_SHADOW;
+      pw_data->sp.sp_namp = pw_data->pw.pw_name;
+      pw_data->sp.sp_lstchg = pw_data->spn.sp_lstchg;
+      pw_data->sp.sp_min = pw_data->spn.sp_min;
+      pw_data->sp.sp_max = pw_data->spn.sp_max;
+      pw_data->sp.sp_warn = pw_data->spn.sp_warn;
+      pw_data->sp.sp_inact = pw_data->spn.sp_inact;
+      pw_data->sp.sp_expire = pw_data->spn.sp_expire;
+    }
+
+  if (write_user_data (pw_data, 0) != 0)
+    {
+      fprintf (stderr, _("Error while changing aging information.\n"));
+      free_user_t (pw_data);
+      return E_FAILURE;
+    }
+  else
+    {
+#ifdef HAVE_NSCD_FLUSH_CACHE
+      nscd_flush_cache ("passwd");
+#endif
+      if (!silent)
+	printf (_("Aging information changed.\n"));
+    }
+
+  if (pw_data->sp.sp_min != pw_data->spn.sp_min)
+    sec_log (program, MSG_MINIMUM_AGE,
+	     pw_data->pw.pw_name, pw_data->pw.pw_uid,
+	     pw_data->spn.sp_min, pw_data->sp.sp_min, uid);
+  if (pw_data->sp.sp_max != pw_data->spn.sp_max)
+    sec_log (program, MSG_MAXIMUM_AGE,
+	     pw_data->pw.pw_name, pw_data->pw.pw_uid,
+	     pw_data->spn.sp_max, pw_data->sp.sp_max, uid);
+  if (pw_data->sp.sp_warn != pw_data->spn.sp_warn)
+    sec_log (program, MSG_WARNING_DAYS,
+	     pw_data->pw.pw_name, pw_data->pw.pw_uid,
+	     pw_data->spn.sp_warn, pw_data->sp.sp_warn, uid);
+  if (pw_data->sp.sp_inact != pw_data->spn.sp_inact)
+    sec_log (program, MSG_INACTIVE_DAYS,
+	     pw_data->pw.pw_name, pw_data->pw.pw_uid,
+	     pw_data->spn.sp_inact, pw_data->sp.sp_inact, uid);
+
+  if (pw_data->sp.sp_lstchg != pw_data->spn.sp_lstchg)
+    {
+      char *new_lstchg, *old_lstchg;
+
+      new_lstchg = date2str (pw_data->spn.sp_lstchg * DAY);
+      old_lstchg = date2str (pw_data->sp.sp_lstchg * DAY);
+      sec_log (program, MSG_LAST_CHANGE_DATE,
+	       pw_data->pw.pw_name, pw_data->pw.pw_uid,
+	       new_lstchg, old_lstchg, uid);
+
+      free(new_lstchg);
+      free(old_lstchg);
+    }
+  if (pw_data->sp.sp_expire != pw_data->spn.sp_expire)
+    {
+      char *new_exp, *old_exp;
+
+      new_exp = date2str (pw_data->spn.sp_expire * DAY);
+      old_exp = date2str (pw_data->sp.sp_expire * DAY);
+      sec_log (program, MSG_EXPIRE_DATE,
+	       pw_data->pw.pw_name, pw_data->pw.pw_uid,
+	       new_exp, old_exp, uid);
+
+      free(new_exp);
+      free(old_exp);
+    }
+
+  free_user_t (pw_data);
+
+  return 0;
 }
-

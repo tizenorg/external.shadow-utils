@@ -1,585 +1,403 @@
-/*
- * Copyright (c) 1990 - 1994, Julianne Frances Haugh
- * Copyright (c) 1996 - 2000, Marek Michałkiewicz
- * Copyright (c) 2000 - 2006, Tomasz Kłoczko
- * Copyright (c) 2007 - 2009, Nicolas François
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The name of the copyright holders or contributors may not be used to
- *    endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+/* Copyright (C) 2003, 2004, 2005 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@suse.de>
 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
+
+
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 
-#ident "$Id: chpasswd.c 2892 2009-05-10 13:49:03Z nekral-guest $"
-
+#include <time.h>
 #include <fcntl.h>
-#include <getopt.h>
-#include <pwd.h>
+#include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
-#ifdef USE_PAM
-#include "pam_defs.h"
-#endif				/* USE_PAM */
-#include "defines.h"
-#include "nscd.h"
-#include "prototypes.h"
-#include "pwio.h"
-#include "shadowio.h"
-/*@-exitarg@*/
-#include "exitcodes.h"
+#include <string.h>
+#include <unistd.h>
+#include <getopt.h>
+#if defined(HAVE_XCRYPT_H)
+#include <xcrypt.h>
+#elif defined(HAVE_CRYPT_H)
+#include <crypt.h>
+#endif
+#include <sys/stat.h>
+#include <sys/types.h>
+#ifdef HAVE_LIBNSCD_H
+#include <libnscd.h>
+#endif
 
-/*
- * Global variables
- */
-char *Prog;
-#ifndef USE_PAM
-static bool cflg   = false;
-static bool eflg   = false;
-static bool md5flg = false;
-#ifdef USE_SHA_CRYPT
-static bool sflg   = false;
-#endif				/* USE_SHA_CRYPT */
+#include "i18n.h"
+#include "public.h"
+#include "logging.h"
+#include "logindefs.h"
+#include "read-files.h"
+#include "error_codes.h"
+#include "parse_crypt_arg.h"
 
-static const char *crypt_method = NULL;
-#ifdef USE_SHA_CRYPT
-static long sha_rounds = 5000;
-#endif				/* USE_SHA_CRYPT */
+#ifdef USE_LDAP
+#include "libldap.h"
+#endif /* USE_LDAP */
 
-static bool is_shadow_pwd;
-static bool pw_locked = false;
-static bool spw_locked = false;
-#endif				/* !USE_PAM */
+#ifndef _
+#define _(String) gettext (String)
+#endif
 
-/* local function prototypes */
-static void fail_exit (int code);
-static void usage (void);
-static void process_flags (int argc, char **argv);
-static void check_flags (void);
-static void check_perms (void);
-#ifndef USE_PAM
-static void open_files (void);
-static void close_files (void);
-#endif				/* !USE_PAM */
-
-/*
- * fail_exit - exit with a failure code after unlocking the files
- */
-static void fail_exit (int code)
+static void
+print_usage (FILE *stream, const char *program)
 {
-#ifndef USE_PAM
-	if (pw_locked) {
-		if (pw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-			/* continue */
-		}
-	}
-
-	if (spw_locked) {
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-	}
-#endif				/* !USE_PAM */
-
-	exit (code);
+  fprintf (stream, _("Usage: %s [-D binddn] [-P path] [-e] [-c des|md5|blowfish] [file]\n"),
+           program);
 }
 
-/*
- * usage - display usage message and exit
- */
-static void usage (void)
+static void
+print_help (const char *program)
 {
-	(void) fprintf (stderr,
-	                _("Usage: %s [options]\n"
-	                  "\n"
-	                  "Options:\n"),
-	                Prog);
-#ifndef USE_PAM
-	(void) fprintf (stderr,
-	                _("  -c, --crypt-method            the crypt method (one of %s)\n"),
-#ifndef USE_SHA_CRYPT
-	                "NONE DES MD5"
-#else				/* USE_SHA_CRYPT */
-	                "NONE DES MD5 SHA256 SHA512"
-#endif				/* USE_SHA_CRYPT */
-	               );
-	(void) fputs (_("  -e, --encrypted               supplied passwords are encrypted\n"), stderr);
-#endif				/* !USE_PAM */
-	(void) fputs (_("  -h, --help                    display this help message and exit\n"), stderr);
-#ifndef USE_PAM
-	(void) fputs (_("  -m, --md5                     encrypt the clear text password using\n"
-	                "                                the MD5 algorithm\n"),
-	              stderr);
-#ifdef USE_SHA_CRYPT
-	(void) fputs (_("  -s, --sha-rounds              number of SHA rounds for the SHA*\n"
-	                "                                crypt algorithms\n"),
-	              stderr);
-#endif				/* USE_SHA_CRYPT */
-#endif				/* !USE_PAM */
-	(void) fputs ("\n", stderr);
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - update password entries in batch\n\n"), program);
 
-	exit (E_USAGE);
+#ifdef USE_LDAP
+  fputs (_("  -D binddn      Use dn \"binddn\" to bind to the LDAP directory\n"),
+         stdout);
+#endif
+  fputs (_("  -P path        Search passwd and shadow file in \"path\"\n"),
+         stdout);
+  fputs (_("  -c, --crypt    Password should be encrypted with DES, MD5 or blowfish\n"),
+	 stdout);
+  fputs (_("  -e, --encrypted The passwords are in encrypted form\n"),
+	 stdout);
+  fputs (_("  --service srv  Use nameservice 'srv'\n"), stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
+  fputs (_("Valid services are: files, nis, nisplus, ldap\n"), stdout);
 }
 
-/*
- * process_flags - parse the command line options
- *
- *	It will not return if an error is encountered.
- */
-static void process_flags (int argc, char **argv)
+int
+main (int argc, char *argv[])
 {
-	int option_index = 0;
-	int c;
-	static struct option long_options[] = {
-#ifndef USE_PAM
-		{"crypt-method", required_argument, NULL, 'c'},
-		{"encrypted", no_argument, NULL, 'e'},
-		{"md5", no_argument, NULL, 'm'},
-#ifdef USE_SHA_CRYPT
-		{"sha-rounds", required_argument, NULL, 's'},
-#endif				/* USE_SHA_CRYPT */
-#endif				/* !USE_PAM */
-		{"help", no_argument, NULL, 'h'},
-		{NULL, 0, NULL, '\0'}
-	};
+  FILE *input = NULL;
+  const char *program = "chpasswd";
+  crypt_t use_crypt;
+  int encrypted = 0;
+  char *buf = NULL;
+  size_t buflen = 0;
+  unsigned long line = 0, errors = 0;
+  char *use_service = NULL;
+#ifdef USE_LDAP
+  char *oldclearpwd = NULL;
+  char *binddn = NULL;
+#endif
 
-	while ((c = getopt_long (argc, argv,
-#ifndef USE_PAM
-# ifdef USE_SHA_CRYPT
-	                         "c:ehms:",
-# else				/* !USE_SHA_CRYPT */
-	                         "c:ehm",
-# endif				/* !USE_SHA_CRYPT */
+#ifdef ENABLE_NLS
+  setlocale(LC_ALL, "");
+  bindtextdomain(PACKAGE, LOCALEDIR);
+  textdomain(PACKAGE);
+#endif
+
+  open_sec_log (program);
+
+  use_crypt = parse_crypt_arg (getlogindefs_str ("CRYPT", "des"));
+
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+      static struct option long_options[] = {
+#ifdef USE_LDAP
+        {"binddn",  required_argument, NULL, 'D' },
+#endif
+        {"path",    required_argument, NULL, 'P' },
+        {"crypt",   no_argument, NULL, 'c' },
+        {"encrypt", no_argument, NULL, 'e' },
+        {"service", required_argument, NULL, '\254' },
+        {"version", no_argument, NULL, 'v' },
+        {"usage",   no_argument, NULL, 'u' },
+        {"help",    no_argument, NULL, '\255' },
+        {NULL,      0,           NULL, '\0'}
+      };
+
+      c = getopt_long (argc, argv, "D:P:c:evu",
+                       long_options, &option_index);
+      if (c == (-1))
+        break;
+      switch (c)
+	{
+#ifdef USE_LDAP
+	case 'D':
+	  binddn = optarg;
+	  break;
+#endif
+	case 'P':
+	  files_etc_dir = strdup (optarg);
+          break;
+	case 'c':
+	  use_crypt = parse_crypt_arg (optarg);
+	  break;
+	case 'e':
+	  ++encrypted;
+	  break;
+        case '\254':
+          if (use_service != NULL)
+            {
+              print_usage (stderr, program);
+              return E_BAD_ARG;
+            }
+
+          if (strcasecmp (optarg, "yp") == 0 ||
+              strcasecmp (optarg, "nis") == 0)
+            use_service = "nis";
+          else if (strcasecmp (optarg, "nis+") == 0 ||
+                   strcasecmp (optarg, "nisplus") == 0)
+            use_service = "nisplus";
+          else if (strcasecmp (optarg, "files") == 0)
+            use_service = "files";
+#ifdef USE_LDAP
+          else if (strcasecmp (optarg, "ldap") == 0)
+            use_service = "ldap";
+#endif
+          else
+            {
+              fprintf (stderr, _("Service `%s' not supported.\n"), optarg);
+              print_usage (stderr, program);
+              return E_BAD_ARG;
+            }
+	  break;
+	case '\255':
+          print_help (program);
+          return 0;
+        case 'v':
+          print_version (program, "2005");
+          return 0;
+        case 'u':
+          print_usage (stdout, program);
+	  return 0;
+	default:
+	  print_error (program);
+	  return E_USAGE;
+	}
+    }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc == 0)
+    input = stdin;
+  else if (argc == 1)
+    {
+      input = fopen (argv[0], "r");
+      if (input == NULL)
+	{
+	  fprintf (stderr, "%s: %s: %s\n", program, argv[0],
+		   strerror (errno));
+	  return E_BAD_ARG;
+	}
+    }
+  else if (argc > 1)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+
+#ifdef USE_LDAP
+  if (binddn)
+    {
+      /* A user tries to change data stored in a LDAP database and
+	 knows the Manager dn, now we need the password from him.  */
+      ldap_session_t *session = create_ldap_session (LDAP_PATH_CONF);
+      char *cp;
+
+      if (session == NULL)
+	return E_FAILURE;
+
+      cp = getpass (_("Enter LDAP Password:"));
+
+      if (open_ldap_session (session) != 0)
+	return E_FAILURE;
+
+      if (ldap_authentication (session, NULL, binddn, cp) != 0)
+	return E_NOPERM;
+
+      close_ldap_session (session);
+
+      oldclearpwd = strdup (cp);
+    }
+#endif /* USE_LDAP */
+
+  /* Read each line, separating login from the password. The password
+     entry for each user will be looked up in the appropriate place,
+     defined through the search order in /etc/nsswitch.conf.  */
+
+  while (!feof (input))
+    {
+      char *tmp, *cp;
+      user_t *pw_data;
+      time_t now;
+#if defined(HAVE_GETLINE)
+      ssize_t n = getline (&buf, &buflen, input);
+#elif defined (HAVE_GETDELIM)
+      ssize_t n = getdelim (&buf, &buflen, '\n', input);
 #else
-	                         "h",
-#endif				/* !USE_PAM */
-	                         long_options, &option_index)) != -1) {
-		switch (c) {
-		case 'h':
-			usage ();
-			break;
-#ifndef USE_PAM
-		case 'c':
-			cflg = true;
-			crypt_method = optarg;
-			break;
-		case 'e':
-			eflg = true;
-			break;
-		case 'm':
-			md5flg = true;
-			break;
-#ifdef USE_SHA_CRYPT
-		case 's':
-			sflg = true;
-			if (getlong(optarg, &sha_rounds) == 0) {
-				fprintf (stderr,
-				         _("%s: invalid numeric argument '%s'\n"),
-				         Prog, optarg);
-				usage ();
-			}
-			break;
-#endif				/* USE_SHA_CRYPT */
-#endif				/* !USE_PAM */
-		default:
-			usage ();
-			break;
-		}
+      ssize_t n;
+
+      if (buf == NULL)
+        {
+          buflen = 8096;
+          buf = malloc (buflen);
+        }
+      buf[0] = '\0';
+      fgets (buf, buflen - 1, input);
+      if (buf != NULL)
+        n = strlen (buf);
+      else
+        n = 0;
+#endif /* HAVE_GETLINE / HAVE_GETDELIM */
+
+      ++line;
+      cp = buf;
+
+      if (n < 1)
+	break;
+
+      tmp = strchr (cp, ':');
+      if (tmp)
+	*tmp = '\0';
+      else
+	{
+	  fprintf (stderr,_("%s: line %ld: missing new password\n"),
+		   program, line);
+	  ++errors;
+	  continue;
 	}
 
-	/* validate options */
-	check_flags ();
+      pw_data = do_getpwnam (cp, use_service);
+      if (pw_data == NULL || pw_data->service == S_NONE)
+	{
+	  fprintf (stderr, _("%s: line %ld: unknown user %s\n"),
+		   program, line, cp);
+	  ++errors;
+	  continue;
+	}
+
+      cp = tmp+1;
+      tmp = strchr (cp, '\n');
+      if (tmp)
+	*tmp = '\0';
+
+      if (encrypted)
+	pw_data->newpassword = strdup (cp);
+      else
+	{
+          char *salt;
+	  struct crypt_data output;
+	  memset (&output, 0, sizeof (output));
+
+	  switch (use_crypt)
+	    {
+	    case DES:
+	      /* If we don't support passwords longer 8 characters,
+		 truncate them */
+	      if (strlen (cp) > 8)
+		cp[8] = '\0';
+	      salt =  make_crypt_salt ("", 0);
+	      if (salt != NULL)
+	        pw_data->newpassword = strdup (crypt_r (cp, salt, &output));
+	      else
+		{
+		  fprintf (stderr, _("Cannot create salt for standard crypt"));
+		  ++errors;
+		  continue;
+		}
+	      free (salt);
+	      break;
+
+	    case MD5:
+	      /* MD5 has a limit of 127 characters */
+	      if (strlen (cp) > 127)
+		cp[127] = '\0';
+	      salt = make_crypt_salt ("$1$", 0);
+	      if (salt != NULL)
+		pw_data->newpassword = strdup (crypt_r (cp, salt, &output));
+	      else
+		{
+		  fprintf (stderr, _("Cannot create salt for MD5 crypt"));
+		  ++errors;
+		  continue;
+		}
+	      free (salt);
+	      break;
+	    case BLOWFISH:
+#if defined(HAVE_XCRYPT_GENSALT_R)
+	      /* blowfish has a limit of 72 characters */
+	      if (use_crypt == BLOWFISH && strlen (cp) > 72)
+		cp[72] = '\0';
+	      salt = make_crypt_salt ("$2a$", 0 /* XXX crypt_rounds */);
+	      if (salt != NULL)
+		pw_data->newpassword = strdup (crypt_r (cp, salt, &output));
+	      else
+		{
+		  fprintf (stderr, _("Cannot create salt for blowfish crypt"));
+		  ++errors;
+		  continue;
+		}
+	      free (salt);
+#endif
+	      break;
+	    default:
+	      abort();
+	    }
+	}
+      time (&now);
+      pw_data->spn.sp_lstchg = (long int)now / (24L*3600L);
+      pw_data->sp_changed = TRUE;
+
+#ifdef USE_LDAP
+      /* Add binddn data if user is stored in LDAP database and
+	 we know the binddn.  */
+      if (pw_data->service == S_LDAP)
+	{
+	  if (binddn)
+	    pw_data->binddn = strdup (binddn);
+	  if (oldclearpwd)
+	    pw_data->oldclearpwd = strdup (oldclearpwd);
+	}
+#endif
+
+      if (write_user_data (pw_data, 0) != 0)
+	{
+	  fprintf (stderr,
+		   _("%s: line %ld: cannot update password entry\n"),
+		   program, line);
+	  ++errors;
+	  continue;
+	}
+
+      free_user_t (pw_data);
+    }
+
+#ifdef HAVE_NSCD_FLUSH_CACHE
+  nscd_flush_cache ("passwd");
+#endif
+
+  if (errors)
+    {
+      fprintf (stderr, _("%s: errors occurred, %ld passwords not updated\n"),
+	       program, errors);
+    }
+
+  if (input != stdin)
+    fclose (input);
+
+  return E_SUCCESS;
 }
-
-/*
- * check_flags - check flags and parameters consistency
- *
- *	It will not return if an error is encountered.
- */
-static void check_flags (void)
-{
-#ifndef USE_PAM
-#ifdef USE_SHA_CRYPT
-	if (sflg && !cflg) {
-		fprintf (stderr,
-		         _("%s: %s flag is only allowed with the %s flag\n"),
-		         Prog, "-s", "-c");
-		usage ();
-	}
-#endif
-
-	if ((eflg && (md5flg || cflg)) ||
-	    (md5flg && cflg)) {
-		fprintf (stderr,
-		         _("%s: the -c, -e, and -m flags are exclusive\n"),
-		         Prog);
-		usage ();
-	}
-
-	if (cflg) {
-		if (   (0 != strcmp (crypt_method, "DES"))
-		    && (0 != strcmp (crypt_method, "MD5"))
-		    && (0 != strcmp (crypt_method, "NONE"))
-#ifdef USE_SHA_CRYPT
-		    && (0 != strcmp (crypt_method, "SHA256"))
-		    && (0 != strcmp (crypt_method, "SHA512"))
-#endif
-		    ) {
-			fprintf (stderr,
-			         _("%s: unsupported crypt method: %s\n"),
-			         Prog, crypt_method);
-			usage ();
-		}
-	}
-#endif				/* USE_PAM */
-}
-
-/*
- * check_perms - check if the caller is allowed to add a group
- *
- *	With PAM support, the setuid bit can be set on chpasswd to allow
- *	non-root users to groups.
- *	Without PAM support, only users who can write in the group databases
- *	can add groups.
- *
- *	It will not return if the user is not allowed.
- */
-static void check_perms (void)
-{
-#ifdef USE_PAM
-#ifdef ACCT_TOOLS_SETUID
-	pam_handle_t *pamh = NULL;
-	int retval;
-	struct passwd *pampw;
-
-	pampw = getpwuid (getuid ()); /* local, no need for xgetpwuid */
-	if (NULL == pampw) {
-		fprintf (stderr,
-		         _("%s: Cannot determine your user name.\n"),
-		         Prog);
-		exit (1);
-	}
-
-	retval = pam_start ("chpasswd", pampw->pw_name, &conv, &pamh);
-
-	if (PAM_SUCCESS == retval) {
-		retval = pam_authenticate (pamh, 0);
-	}
-
-	if (PAM_SUCCESS == retval) {
-		retval = pam_acct_mgmt (pamh, 0);
-	}
-
-	if (NULL != pamh) {
-		(void) pam_end (pamh, retval);
-	}
-	if (PAM_SUCCESS != retval) {
-		fprintf (stderr, _("%s: PAM authentication failed\n"), Prog);
-		exit (1);
-	}
-#endif				/* ACCT_TOOLS_SETUID */
-#endif				/* USE_PAM */
-}
-
-#ifndef USE_PAM
-/*
- * open_files - lock and open the password databases
- */
-static void open_files (void)
-{
-	/*
-	 * Lock the password file and open it for reading and writing. This
-	 * will bring all of the entries into memory where they may be updated.
-	 */
-	if (pw_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, pw_dbname ());
-		fail_exit (1);
-	}
-	pw_locked = true;
-	if (pw_open (O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"), Prog, pw_dbname ());
-		fail_exit (1);
-	}
-
-	/* Do the same for the shadowed database, if it exist */
-	if (is_shadow_pwd) {
-		if (spw_lock () == 0) {
-			fprintf (stderr,
-			         _("%s: cannot lock %s; try again later.\n"),
-			         Prog, spw_dbname ());
-			fail_exit (1);
-		}
-		spw_locked = true;
-		if (spw_open (O_RDWR) == 0) {
-			fprintf (stderr,
-			         _("%s: cannot open %s\n"),
-			         Prog, spw_dbname ());
-			fail_exit (1);
-		}
-	}
-}
-
-/*
- * close_files - close and unlock the password databases
- */
-static void close_files (void)
-{
-	if (is_shadow_pwd) {
-		if (spw_close () == 0) {
-			fprintf (stderr,
-			         _("%s: failure while writing changes to %s\n"),
-			         Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failure while writing changes to %s", spw_dbname ()));
-			fail_exit (1);
-		}
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-		spw_locked = false;
-	}
-
-	if (pw_close () == 0) {
-		fprintf (stderr,
-		         _("%s: failure while writing changes to %s\n"),
-		         Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", pw_dbname ()));
-		fail_exit (1);
-	}
-	if (pw_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-		/* continue */
-	}
-	pw_locked = false;
-}
-#endif
-
-int main (int argc, char **argv)
-{
-	char buf[BUFSIZ];
-	char *name;
-	char *newpwd;
-	char *cp;
-
-#ifndef USE_PAM
-	const struct spwd *sp;
-	struct spwd newsp;
-
-	const struct passwd *pw;
-	struct passwd newpw;
-#endif				/* !USE_PAM */
-
-	int errors = 0;
-	int line = 0;
-
-	Prog = Basename (argv[0]);
-
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
-
-	process_flags (argc, argv);
-
-	OPENLOG ("chpasswd");
-
-	check_perms ();
-
-#ifndef USE_PAM
-	is_shadow_pwd = spw_file_present ();
-
-	open_files ();
-#endif
-
-	/*
-	 * Read each line, separating the user name from the password. The
-	 * password entry for each user will be looked up in the appropriate
-	 * file (shadow or passwd) and the password changed. For shadow
-	 * files the last change date is set directly, for passwd files the
-	 * last change date is set in the age only if aging information is
-	 * present.
-	 */
-	while (fgets (buf, (int) sizeof buf, stdin) != (char *) 0) {
-		line++;
-		cp = strrchr (buf, '\n');
-		if (NULL != cp) {
-			*cp = '\0';
-		} else {
-			if (feof (stdin) == 0) {
-				fprintf (stderr,
-				         _("%s: line %d: line too long\n"),
-				         Prog, line);
-				errors++;
-				continue;
-			}
-		}
-
-		/*
-		 * The username is the first field. It is separated from the
-		 * password with a ":" character which is replaced with a
-		 * NUL to give the new password. The new password will then
-		 * be encrypted in the normal fashion with a new salt
-		 * generated, unless the '-e' is given, in which case it is
-		 * assumed to already be encrypted.
-		 */
-
-		name = buf;
-		cp = strchr (name, ':');
-		if (NULL != cp) {
-			*cp = '\0';
-			cp++;
-		} else {
-			fprintf (stderr,
-			         _("%s: line %d: missing new password\n"),
-			         Prog, line);
-			errors++;
-			continue;
-		}
-		newpwd = cp;
-
-#ifdef USE_PAM
-		if (do_pam_passwd_non_interractive ("chpasswd", name, newpwd) != 0) {
-			fprintf (stderr,
-			         _("%s: (line %d, user %s) password not changed\n"),
-			         Prog, line, name);
-			errors++;
-		}
-#else				/* !USE_PAM */
-		if (   !eflg
-		    && (   (NULL == crypt_method)
-		        || (0 != strcmp (crypt_method, "NONE")))) {
-			void *arg = NULL;
-			if (md5flg) {
-				crypt_method = "MD5";
-			} else if (crypt_method != NULL) {
-#ifdef USE_SHA_CRYPT
-				if (sflg) {
-					arg = &sha_rounds;
-				}
-#endif
-			} else {
-				crypt_method = NULL;
-			}
-			cp = pw_encrypt (newpwd,
-			                 crypt_make_salt(crypt_method, arg));
-		}
-
-		/*
-		 * Get the password file entry for this user. The user must
-		 * already exist.
-		 */
-		pw = pw_locate (name);
-		if (NULL == pw) {
-			fprintf (stderr,
-			         _("%s: line %d: user '%s' does not exist\n"), Prog,
-			         line, name);
-			errors++;
-			continue;
-		}
-		if (is_shadow_pwd) {
-			sp = spw_locate (name);
-		} else {
-			sp = NULL;
-		}
-
-		/*
-		 * The freshly encrypted new password is merged into the
-		 * user's password file entry and the last password change
-		 * date is set to the current date.
-		 */
-		if (NULL != sp) {
-			newsp = *sp;
-			newsp.sp_pwdp = cp;
-			newsp.sp_lstchg = (long) time ((time_t *)NULL) / SCALE;
-			if (0 == newsp.sp_lstchg) {
-				/* Better disable aging than requiring a
-				 * password change */
-				newsp.sp_lstchg = -1;
-			}
-		} else {
-			newpw = *pw;
-			newpw.pw_passwd = cp;
-		}
-
-		/* 
-		 * The updated password file entry is then put back and will
-		 * be written to the password file later, after all the
-		 * other entries have been updated as well.
-		 */
-		if (NULL != sp) {
-			if (spw_update (&newsp) == 0) {
-				fprintf (stderr,
-				         _("%s: line %d: failed to prepare the new %s entry '%s'\n"),
-				         Prog, line, spw_dbname (), newsp.sp_namp);
-				errors++;
-				continue;
-			}
-		} else {
-			if (pw_update (&newpw) == 0) {
-				fprintf (stderr,
-				         _("%s: line %d: failed to prepare the new %s entry '%s'\n"),
-				         Prog, line, pw_dbname (), newpw.pw_name);
-				errors++;
-				continue;
-			}
-		}
-#endif				/* !USE_PAM */
-	}
-
-	/*
-	 * Any detected errors will cause the entire set of changes to be
-	 * aborted. Unlocking the password file will cause all of the
-	 * changes to be ignored. Otherwise the file is closed, causing the
-	 * changes to be written out all at once, and then unlocked
-	 * afterwards.
-	 *
-	 * With PAM, it is not possible to delay the update of the
-	 * password database.
-	 */
-	if (0 != errors) {
-#ifndef USE_PAM
-		fprintf (stderr,
-		         _("%s: error detected, changes ignored\n"), Prog);
-#endif
-		fail_exit (1);
-	}
-
-#ifndef USE_PAM
-	/* Save the changes */
-	close_files ();
-#endif
-
-	nscd_flush_cache ("passwd");
-
-	return (0);
-}
-

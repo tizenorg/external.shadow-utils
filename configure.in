@@ -1,548 +1,341 @@
-dnl Process this file with autoconf to produce a configure script.
-AC_INIT
-AM_INIT_AUTOMAKE(shadow, 4.1.4.2)
-AC_CONFIG_HEADERS([config.h])
+dnl
+dnl Copyright (c) 2001-2012 Thorsten Kukuk, Germany
+dnl
+dnl Author: Thorsten Kukuk <kukuk@thkukuk.de>
+dnl
+AC_INIT(src/passwd.c)
+AM_INIT_AUTOMAKE("pwdutils", 3.2.19)
+AM_CONFIG_HEADER(config.h)
+AC_PREFIX_DEFAULT(/usr)
+AC_CANONICAL_HOST
+
+AC_SUBST(PACKAGE)
+AC_SUBST(VERSION)
 
 dnl Some hacks...
-test "$prefix" = "NONE" && prefix="/usr"
-test "$prefix" = "/usr" && exec_prefix=""
+test "${prefix}" = "NONE" && prefix="/usr"
+test "${exec_prefix}" = "NONE" && exec_prefix="/usr"
 
-AC_GNU_SOURCE
+if test ${prefix} = '/usr'
+then
+dnl If we use /usr as prefix, use /etc for config files
+	if test ${sysconfdir} = '${prefix}/etc'
+	then
+		sysconfdir="/etc"
+	fi
+dnl If we use /usr as prefix, use /usr/share/man for manual pages
+	if test ${mandir} = '${prefix}/man'
+	then
+		mandir='${prefix}/share/man'
+	fi
+fi
+if test ${exec_prefix} = '/usr'
+then
+dnl Choose between lib and lib64
+	if test ${libdir} = '${exec_prefix}/lib'
+        then
+                case "`uname -m`" in
+                    x86_64|ppc64|s390x|sparc64)
+                        libdir="${exec_prefix}/lib64" ;;
+                    *)
+                        libdir="${exec_prefix}/lib" ;;
+                esac
+        fi
 
-AM_DISABLE_SHARED
-AM_ENABLE_STATIC
-
-AM_MAINTAINER_MODE
+fi
 
 dnl Checks for programs.
 AC_PROG_CC
+AM_PROG_CC_C_O
+AC_GNU_SOURCE
 AC_ISC_POSIX
-AC_PROG_LN_S
-AC_PROG_YACC
-AM_C_PROTOTYPES
-AM_PROG_LIBTOOL
-
-dnl Checks for libraries.
-
-dnl Checks for header files.
-AC_HEADER_DIRENT
-AC_HEADER_STDC
-AC_HEADER_SYS_WAIT
-AC_HEADER_STDBOOL
-
-AC_CHECK_HEADERS(errno.h fcntl.h limits.h unistd.h sys/time.h utmp.h \
-	utmpx.h termios.h termio.h sgtty.h sys/ioctl.h syslog.h paths.h \
-	utime.h ulimit.h sys/resource.h gshadow.h lastlog.h \
-	locale.h rpc/key_prot.h netdb.h)
-
-dnl shadow now uses the libc's shadow implementation
-AC_CHECK_HEADER([shadow.h],,[AC_MSG_ERROR([You need a libc with shadow.h])])
-
-AC_CHECK_FUNCS(l64a fchmod fchown fsync futimes getgroups gethostname getspnam \
-	gettimeofday getusershell getutent initgroups lchown lckpwdf lstat \
-	lutimes memcpy memset setgroups sigaction strchr updwtmp updwtmpx innetgr \
-	getpwnam_r getpwuid_r getgrnam_r getgrgid_r getspnam_r getaddrinfo)
+AC_PROG_INSTALL
+AC_PROG_MAKE_SET
+AC_PROG_LIBTOOL
 AC_SYS_LARGEFILE
 
-dnl Checks for typedefs, structures, and compiler characteristics.
-AC_C_CONST
-AC_TYPE_UID_T
-AC_TYPE_OFF_T
-AC_TYPE_PID_T
-AC_TYPE_MODE_T
-AC_HEADER_STAT
-AC_CHECK_MEMBERS([struct stat.st_rdev])
-AC_CHECK_MEMBERS([struct stat.st_atim])
-AC_CHECK_MEMBERS([struct stat.st_atimensec])
-AC_CHECK_MEMBERS([struct stat.st_mtim])
-AC_CHECK_MEMBERS([struct stat.st_mtimensec])
-AC_HEADER_TIME
-AC_STRUCT_TM
-
-AC_CHECK_MEMBERS([struct utmp.ut_type,
-                  struct utmp.ut_id,
-                  struct utmp.ut_name,
-                  struct utmp.ut_user,
-                  struct utmp.ut_host,
-                  struct utmp.ut_syslen,
-                  struct utmp.ut_addr,
-                  struct utmp.ut_addr_v6,
-                  struct utmp.ut_time,
-                  struct utmp.ut_xtime,
-                  struct utmp.ut_tv],,,[[#include <utmp.h>]])
-dnl There are dependencies:
-dnl If UTMPX has to be used, the utmp structure shall have a ut_id field.
-if test "$ac_cv_header_utmpx_h" = "yes" &&
-   test "$ac_cv_member_struct_utmp_ut_id" != "yes"; then
-	AC_MSG_ERROR(Systems with UTMPX and no ut_id field in the utmp structure are not supported)
+EXTRA_CFLAGS=""
+if eval "test x$GCC = xyes"; then
+  for flag in \
+-W -Wall -Wbad-function-cast -Wcast-align -Wcast-qual -Winline -Wmissing-declarations -Wmissing-prototypes -Wnested-externs -Wshadow -Wstrict-prototypes -Wundef -Wpointer-arith
+  do
+    JAPHAR_GREP_CFLAGS($flag, [ EXTRA_CFLAGS="$EXTRA_CFLAGS $flag" ])
+  done
 fi
+AC_SUBST(EXTRA_CFLAGS)
 
-AC_CHECK_MEMBERS([struct utmpx.ut_name,
-                  struct utmpx.ut_host,
-                  struct utmpx.ut_syslen,
-                  struct utmpx.ut_addr,
-                  struct utmpx.ut_addr_v6,
-                  struct utmpx.ut_time,
-                  struct utmpx.ut_xtime],,,[[#include <utmpx.h>]])
+AC_ENABLE_STATIC([no])
+AC_ENABLE_SHARED([yes])
 
-if test "$ac_cv_header_lastlog_h" = "yes"; then
-	AC_CACHE_CHECK(for ll_host in struct lastlog,
-		ac_cv_struct_lastlog_ll_host,
-		AC_COMPILE_IFELSE([AC_LANG_PROGRAM([#include <lastlog.h>],
-					[struct lastlog ll; char *cp = ll.ll_host;]
-				)],
-			[ac_cv_struct_lastlog_ll_host=yes],
-			[ac_cv_struct_lastlog_ll_host=no]
-		)
-	)
+AC_CACHE_CHECK(for -fpie, libc_cv_fpie, [dnl
+  cat > conftest.c <<EOF
+int foo;
+main () { return 0;}
+EOF
+  if AC_TRY_COMMAND([${CC-cc} $CFLAGS $CPPFLAGS $LDFLAGS -pie -fpie
+                              -o conftest conftest.c 1>&AS_MESSAGE_LOG_FD])
+  then
+    libc_cv_fpie=yes
+    PIE_CFLAGS="-fpie"
+    PIE_LDFLAGS="-pie"
+  else
+    libc_cv_fpie=no
+    PIE_CFLAGS=""
+    PIE_LDFLAGS=""
+  fi
+  rm -f conftest*])
+AC_SUBST(libc_cv_fpie)
+AC_SUBST(PIE_CFLAGS)
+AC_SUBST(PIE_LDFLAGS)
 
-	if test "$ac_cv_struct_lastlog_ll_host" = "yes"; then
-		AC_DEFINE(HAVE_LL_HOST, 1,
-			[Define if struct lastlog has ll_host])
-	fi
-fi
+dnl allow linking against some debugging libraries
+AM_WITH_DMALLOC
 
-dnl Checks for library functions.
-AC_TYPE_GETGROUPS
-AC_TYPE_SIGNAL
-AC_FUNC_UTIME_NULL
-AC_FUNC_STRFTIME
-AC_REPLACE_FUNCS(mkdir putgrent putpwent putspent rename rmdir)
-AC_REPLACE_FUNCS(sgetgrent sgetpwent sgetspent)
-AC_REPLACE_FUNCS(snprintf strcasecmp strdup strerror strstr)
+dnl Should we build pam_rpasswd?
+AC_ARG_ENABLE([pam_rpasswd],
+   AC_HELP_STRING([--enable-pam_rpasswd],[Enable build of pam_rpasswd]))
+AM_CONDITIONAL(build_PAM_RPASSWD, test "$enable_pam_rpasswd" = "yes")
 
-AC_CHECK_FUNC(setpgrp)
-AC_FUNC_SETPGRP
-
-if test "$ac_cv_header_shadow_h" = "yes"; then
-	AC_CACHE_CHECK(for working shadow group support,
-		ac_cv_libc_shadowgrp,
-		AC_RUN_IFELSE([AC_LANG_SOURCE([
-				#include <shadow.h>
-				main()
-				{
-					struct sgrp *sg = sgetsgent("test:x::");
-					/* NYS libc on Red Hat 3.0.3 has broken shadow group support */
-					return !sg || !sg->sg_adm || !sg->sg_mem;
-				}]
-			)],
-			[ac_cv_libc_shadowgrp=yes],
-			[ac_cv_libc_shadowgrp=no],
-			[ac_cv_libc_shadowgrp=no]
-		)
-	)
-
-	if test "$ac_cv_libc_shadowgrp" = "yes"; then
-		AC_DEFINE(HAVE_SHADOWGRP, 1, [Have working shadow group support in libc])
-	fi
-fi
-
-AC_CACHE_CHECK([location of shared mail directory], shadow_cv_maildir,
-[for shadow_cv_maildir in /var/mail /var/spool/mail /usr/spool/mail /usr/mail none; do
-	if test -d $shadow_cv_maildir; then
-		break
-	fi
-done])
-if test $shadow_cv_maildir != none; then
-	AC_DEFINE_UNQUOTED(MAIL_SPOOL_DIR, "$shadow_cv_maildir",
-		[Location of system mail spool directory.])
-fi
-
-AC_CACHE_CHECK([location of user mail file], shadow_cv_mailfile,
-[for shadow_cv_mailfile in Mailbox mailbox Mail mail .mail none; do
-	if test -f $HOME/$shadow_cv_mailfile; then
-		break
-	fi
-done])
-if test $shadow_cv_mailfile != none; then
-	AC_DEFINE_UNQUOTED(MAIL_SPOOL_FILE, "$shadow_cv_mailfile",
-		[Name of user's mail spool file if stored in user's home directory.])
-fi
-
-AC_CACHE_CHECK([location of utmp], shadow_cv_utmpdir,
-[for shadow_cv_utmpdir in /var/run /var/adm /usr/adm /etc none; do
-	if test -f $shadow_cv_utmpdir/utmp; then
-		break
-	fi
-done])
-if test "$shadow_cv_utmpdir" = "none"; then
-	AC_MSG_WARN(utmp file not found)
-fi
-AC_DEFINE_UNQUOTED(_UTMP_FILE, "$shadow_cv_utmpdir/utmp",
-	[Path for utmp file.])
-
-AC_CACHE_CHECK([location of faillog/lastlog/wtmp], shadow_cv_logdir,
-[for shadow_cv_logdir in /var/log /var/adm /usr/adm /etc; do
-	if test -d $shadow_cv_logdir; then
-		break
-	fi
-done])
-AC_DEFINE_UNQUOTED(_WTMP_FILE, "$shadow_cv_logdir/wtmp",
-	[Path for wtmp file.])
-AC_DEFINE_UNQUOTED(LASTLOG_FILE, "$shadow_cv_logdir/lastlog",
-	[Path for lastlog file.])
-AC_DEFINE_UNQUOTED(FAILLOG_FILE, "$shadow_cv_logdir/faillog",
-	[Path for faillog file.])
-
-AC_CACHE_CHECK([location of the passwd program], shadow_cv_passwd_dir,
-[if test -f /usr/bin/passwd; then
-	shadow_cv_passwd_dir=/usr/bin
+dnl Should we compile with SELinux support? default: no
+AC_ARG_ENABLE([selinux],
+   AC_HELP_STRING([--disable-selinux],[Disable SELinux support]))
+AC_ARG_ENABLE([static-selinux],
+   AC_HELP_STRING([--enable-static-selinux],
+                  [Compile in SELinux support static]))
+if test "$enable_selinux" \!= "no" -a "$enable_static_selinux" = "yes" ; then
+   AC_CHECK_LIB(selinux,is_selinux_enabled,
+	[AC_DEFINE(WITH_SELINUX,1,
+	           [Define if you want to compile in SELinux support])
+		    SELINUX_LIB="-Wl,-Bstatic -lselinux -Wl,-dy"],
+	[SELINUX_LIB=""])
+elif test "$enable_selinux" \!= "no" ; then
+   AC_CHECK_LIB(selinux,is_selinux_enabled,
+	[AC_DEFINE(WITH_SELINUX,1,
+		[Define if you want to compile in SELinux support])
+	 SELINUX_LIB="-lselinux"],[SELINUX_LIB=""])
 else
-	shadow_cv_passwd_dir=/bin
-fi])
-AC_DEFINE_UNQUOTED(PASSWD_PROGRAM, "$shadow_cv_passwd_dir/passwd",
-	[Path to passwd program.])
-
-dnl XXX - quick hack, should disappear before anyone notices :).
-AC_DEFINE(USE_SYSLOG, 1, [Define to use syslog().])
-AC_DEFINE(RLOGIN, 1, [Define if login should support the -r flag for rlogind.])
-AC_DEFINE(RUSEROK, 0, [Define to the ruserok() "success" return value (0 or 1).])
-
-AC_ARG_ENABLE(shadowgrp,
-	[AC_HELP_STRING([--enable-shadowgrp], [enable shadow group support @<:@default=yes@:>@])],
-	[case "${enableval}" in
-	 yes) enable_shadowgrp="yes" ;;
-	  no) enable_shadowgrp="no" ;;
-	   *) AC_MSG_ERROR(bad value ${enableval} for --enable-shadowgrp) ;;
-	 esac],
-	[enable_shadowgrp="yes"]
-)
-
-AC_ARG_ENABLE(man,
-	[AC_HELP_STRING([--enable-man],
-		[regenerate roff man pages from Docbook @<:@default=no@:>@])],
-	[enable_man="${enableval}"],
-	[enable_man="no"]
-)
-
-AC_ARG_ENABLE(account-tools-setuid,
-	[AC_HELP_STRING([--enable-account-tools-setuid],
-		[Install the user and group management tools setuid and authenticate the callers. This requires --with-pam.])],
-	[case "${enableval}" in
-	 yes) enable_acct_tools_setuid="yes" ;;
-	  no) enable_acct_tools_setuid="no" ;;
-	   *) AC_MSG_ERROR(bad value ${enableval} for --enable-account-tools-setuid)
-	   ;;
-	 esac],
-	[enable_acct_tools_setuid="maybe"]
-)
-
-AC_ARG_ENABLE(utmpx,
-	[AC_HELP_STRING([--enable-utmpx],
-	                [enable loggin in utmpx / wtmpx @<:@default=no@:>@])],
-	[case "${enableval}" in
-	 yes) enable_utmpx="yes" ;;
-	  no) enable_utmpx="no" ;;
-	   *) AC_MSG_ERROR(bad value ${enableval} for --enable-utmpx) ;;
-	 esac],
-	[enable_utmpx="no"]
-)
-
-AC_ARG_WITH(audit, 
-	[AC_HELP_STRING([--with-audit], [use auditing support @<:@default=yes if found@:>@])],
-	[with_audit=$withval], [with_audit=maybe])
-AC_ARG_WITH(libpam,
-	[AC_HELP_STRING([--with-libpam], [use libpam for PAM support @<:@default=yes if found@:>@])],
-	[with_libpam=$withval], [with_libpam=maybe])
-AC_ARG_WITH(selinux,
-	[AC_HELP_STRING([--with-selinux], [use SELinux support @<:@default=yes if found@:>@])],
-	[with_selinux=$withval], [with_selinux=maybe])
-AC_ARG_WITH(skey,
-	[AC_HELP_STRING([--with-skey], [use S/Key support @<:@default=no@:>@])],
-	[with_skey=$withval], [with_skey=no])
-AC_ARG_WITH(libcrack,
-	[AC_HELP_STRING([--with-libcrack], [use libcrack @<:@default=yes if found and if PAM not enabled@:>@])],
-	[with_libcrack=$withval], [with_libcrack=no])
-AC_ARG_WITH(sha-crypt,
-	[AC_HELP_STRING([--with-sha-crypt], [allow the SHA256 and SHA512 password encryption algorithms @<:@default=yes@:>@])],
-	[with_sha_crypt=$withval], [with_sha_crypt=yes])
-AC_ARG_WITH(nscd,
-	[AC_HELP_STRING([--with-nscd], [enable support for nscd @<:@default=yes@:>@])],
-	[with_nscd=$withval], [with_nscd=yes])
-AC_ARG_WITH(group-name-max-length,
-	[AC_HELP_STRING([--with-group-name-max-length], [set max group name length @<:@default=16@:>@])],
-	[with_group_name_max_length=$withval], [with_group_name_max_length=yes])
-
-if test "$with_group_name_max_length" = "no" ; then
-	with_group_name_max_length=0
-elif test "$with_group_name_max_length" = "yes" ; then
-	with_group_name_max_length=16
+   SELINUX_LIB=""
 fi
-AC_DEFINE_UNQUOTED(GROUP_NAME_MAX_LENGTH, $with_group_name_max_length, [max group name length])
-AC_SUBST(GROUP_NAME_MAX_LENGTH)
-GROUP_NAME_MAX_LENGTH="$with_group_name_max_length"
+AC_SUBST(SELINUX_LIB)
 
-AM_CONDITIONAL(USE_SHA_CRYPT, test "x$with_sha_crypt" = "xyes")
-if test "$with_sha_crypt" = "yes"; then
-	AC_DEFINE(USE_SHA_CRYPT, 1, [Define to allow the SHA256 and SHA512 password encryption algorithms])
+dnl Check for SLP support for rpasswd/rpasswdd
+AC_ARG_ENABLE([slp],
+   AC_HELP_STRING([--disable-slp],[Disable SLP support]))
+
+AC_CHECK_HEADERS([slp.h])
+
+SLP_LIBS=""
+if test "$enable_slp" \!= "no"
+then
+  AC_CHECK_LIB(slp,SLPReg,SLP_LIBS="-lslp",SLP_LIBS="")
+  if test -n "$SLP_LIBS" -a x$ac_cv_header_slp_h != xno
+  then
+    AC_DEFINE(USE_SLP, 1, [Enable SLP support])
+  fi
 fi
+AC_SUBST(SLP_LIBS)
 
-if test "$with_nscd" = "yes"; then
-	AC_CHECK_FUNC(posix_spawn,
-	              [AC_DEFINE(USE_NSCD, 1, [Define to support flushing of nscd caches])],
-	              [AC_MSG_ERROR([posix_spawn is needed for nscd support])])
+LAUS_LIBS=""
+AC_ARG_ENABLE([laus-plugin],
+   AC_HELP_STRING([--disable-laus-plugin],[Disable build of LAuS plugin]))
+if test "$enable_laus_plugin" \!= "no"
+then
+  AC_CHECK_HEADER([laus.h], [ laus_header="yes" ], [ laus_header="no" ])
+  if test "$laus_header" = "yes"; then
+    AC_CHECK_LIB(laus, laus_open,
+		 AC_DEFINE(HAVE_LIBLAUS, 1, ["LAuS Support"]) [LAUS_LIBS="-llaus"])
+  fi
 fi
+AC_SUBST(LAUS_LIBS)
+AM_CONDITIONAL(build_LAUS_PLUGIN, test -n "$LAUS_LIBS")
 
-dnl Check for some functions in libc first, only if not found check for
-dnl other libraries.  This should prevent linking libnsl if not really
-dnl needed (Linux glibc, Irix), but still link it if needed (Solaris).
-
-AC_SEARCH_LIBS(inet_ntoa, inet)
-AC_SEARCH_LIBS(socket, socket)
-AC_SEARCH_LIBS(gethostbyname, nsl)
-
-if test "$enable_shadowgrp" = "yes"; then
-	AC_DEFINE(SHADOWGRP, 1, [Define to support the shadow group file.])
+AUDIT_LIBS=""
+AC_ARG_ENABLE([audit-plugin],
+   AC_HELP_STRING([--disable-audit-plugin],[Disable build of Linux audit plugin]))
+if test "$enable_audit_plugin" \!= "no"
+then
+  AC_CHECK_HEADER([libaudit.h], [audit_header="yes"], [audit_header="no"])
+  if test "$audit_header" = "yes"; then
+    AC_CHECK_LIB(audit, audit_open,
+                 AC_DEFINE(HAVE_LIBAUDIT, 1, ["Linux audit Support"]) [AUDIT_LIBS="-laudit"])
+  fi
 fi
-AM_CONDITIONAL(SHADOWGRP, test "x$enable_shadowgrp" = "xyes")
+AC_SUBST(AUDIT_LIBS)
+AM_CONDITIONAL(build_AUDIT_PLUGIN, test -n "$AUDIT_LIBS")
 
-if test "$enable_man" = "yes"; then
-	dnl
-	dnl Check for xsltproc
-	dnl
-	AC_PATH_PROG([XSLTPROC], [xsltproc])
-	if test -z "$XSLTPROC"; then
-		enable_man=no
-	fi
+dnl Checks for libraries.
+dnl BACKUP_LIBS, we wish to have -ldl extra.
+BACKUP_LIBS=$LIBS
+AC_CHECK_LIB(dl, dlopen, DL_LIBS="-ldl", DL_LIBS="")
+AC_SUBST(DL_LIBS)
+LIBS=$BACKUP_LIBS
 
-	dnl check for DocBook DTD and stylesheets in the local catalog.
-	JH_CHECK_XML_CATALOG([-//OASIS//DTD DocBook XML V4.1.2//EN],
-		[DocBook XML DTD V4.1.2], [], enable_man=no)
-	JH_CHECK_XML_CATALOG([http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl],
-		[DocBook XSL Stylesheets >= 1.70.1], [], enable_man=no)
+dnl BACKUP_LIBS, we wish to have PAM extra.
+BACKUP_LIBS=$LIBS
+AC_CHECK_LIB(pam, pam_start, PAM_LIBS="-lpam", PAM_LIBS="")
+AC_CHECK_LIB(pam_misc, main, PAM_LIBS="-lpam_misc $PAM_LIBS", PAM_LIBS="$PAM_LIBS", $PAM_LIBS)
+if test -z "$PAM_LIBS"; then
+  echo PAM libraries are required for compiling this package!
+  exit 1
 fi
-AM_CONDITIONAL(ENABLE_REGENERATE_MAN, test "x$enable_man" != "xno")
+AC_SUBST(PAM_LIBS)
+LIBS=$BACKUP_LIBS
+AC_CHECK_LIB(nsl, yp_get_default_domain, NSL_LIB="-lnsl", NSL_LIB="")
+AC_SUBST(NSL_LIB)
+dnl Backup LIBS, AC_SEARCH_LIBS will append the library always to LIBS.
+BACKUP_LIBS=$LIBS
+AC_SEARCH_LIBS([crypt],[xcrypt crypt], CRYPT_LIB="-l$ac_lib", CRYPT_LIB="")
+LIBS=$BACKUP_LIBS
+AC_SUBST(CRYPT_LIB)
+AC_CHECK_HEADERS([xcrypt.h crypt.h],[break])
+dnl Save old LIBS variable and add crypt library
+BACKUP_LIBS=$LIBS
+LIBS="$LIBS $CRYPT_LIB"
+dnl Function check for blowfish crypt
+AC_CHECK_FUNCS(crypt crypt_r xcrypt_gensalt_r)
+dnl restore old LIBS variable
+LIBS=$BACKUP_LIBS
 
-AC_SUBST(LIBCRYPT)
-AC_CHECK_LIB(crypt, crypt, [LIBCRYPT=-lcrypt],
-	[AC_MSG_ERROR([crypt() not found])])
-
-AC_SUBST(LIBAUDIT)
-if test "$with_audit" != "no"; then
-	AC_CHECK_HEADER(libaudit.h, [audit_header="yes"], [audit_header="no"])
-	if test "$audit_header$with_audit" = "noyes" ; then
-		AC_MSG_ERROR([libaudit.h is missing])
-	elif test "$audit_header" = "yes"; then
-		AC_CHECK_DECL(AUDIT_ADD_USER,,[audit_header="no"],[#include <libaudit.h>])
-		AC_CHECK_DECL(AUDIT_DEL_USER,,[audit_header="no"],[#include <libaudit.h>])
-		AC_CHECK_DECL(AUDIT_ADD_GROUP,,[audit_header="no"],[#include <libaudit.h>])
-		AC_CHECK_DECL(AUDIT_DEL_GROUP,,[audit_header="no"],[#include <libaudit.h>])
-		if test "$audit_header$with_audit" = "noyes" ; then
-			AC_MSG_ERROR([AUDIT_ADD_USER AUDIT_DEL_USER AUDIT_ADD_GROUP or AUDIT_DEL_GROUP missing from libaudit.h])
-		fi
-	fi
-	if test "$audit_header" = "yes"; then
-		AC_CHECK_LIB(audit, audit_log_acct_message,
-		             [audit_lib="yes"], [audit_lib="no"])
-		if test "$audit_lib$with_audit" = "noyes" ; then
-			AC_MSG_ERROR([libaudit not found])
-		elif test "$audit_lib" = "no" ; then
-			with_audit="no"
-		else
-			AC_DEFINE(WITH_AUDIT, 1,
-			          [Define if you want to enable Audit messages])
-			LIBAUDIT="-laudit"
-			with_audit="yes"
-		fi
-	else
-		with_audit="no"
-	fi
-fi
-
-AC_SUBST(LIBCRACK)
-if test "$with_libcrack" = "yes"; then
-	echo "checking cracklib flavour, don't be surprised by the results"
-	AC_CHECK_LIB(crack, FascistCheck,
-		[LIBCRACK=-lcrack AC_DEFINE(HAVE_LIBCRACK, 1, [Defined if you have libcrack.])])
-	AC_CHECK_LIB(crack, FascistHistory,
-		AC_DEFINE(HAVE_LIBCRACK_HIST, 1, [Defined if you have the ts&szs cracklib.]))
-	AC_CHECK_LIB(crack, FascistHistoryPw,
-		AC_DEFINE(HAVE_LIBCRACK_PW, 1, [Defined if it includes *Pw functions.]))
-fi
-
-AC_SUBST(LIBSELINUX)
-if test "$with_selinux" != "no"; then
-	AC_CHECK_HEADERS(selinux/selinux.h, [selinux_header="yes"], [selinux_header="no"])
-	if test "$selinux_header$with_selinux" = "noyes" ; then
-		AC_MSG_ERROR([selinux/selinux.h is missing])
-	elif test "$selinux_header" = "yes" ; then
-		AC_CHECK_LIB(selinux, is_selinux_enabled,
-		             [selinux_lib="yes"], [selinux_lib="no"])
-		if test "$selinux_lib$with_selinux" = "noyes" ; then
-			AC_MSG_ERROR([libselinux not found])
-		elif test "$selinux_lib" = "no" ; then
-			with_selinux="no"
-		else
-			AC_DEFINE(WITH_SELINUX, 1,
-			          [Build shadow with SELinux support])
-			LIBSELINUX="-lselinux"
-			with_selinux="yes"
-		fi
-	else
-		with_selinux="no"
-	fi
-fi
-
-AC_SUBST(LIBPAM)
-if test "$with_libpam" != "no"; then
-	AC_CHECK_LIB(pam, pam_start,
-	             [pam_lib="yes"], [pam_lib="no"])
-	if test "$pam_lib$with_libpam" = "noyes" ; then
-		AC_MSG_ERROR(libpam not found)
-	fi
-
-	LIBPAM="-lpam"
-	pam_conv_function="no"
-
-	AC_CHECK_LIB(pam, openpam_ttyconv,
-	             [pam_conv_function="openpam_ttyconv"],
-	             AC_CHECK_LIB(pam_misc, misc_conv,
-	                          [pam_conv_function="misc_conv"; LIBPAM="$LIBPAM -lpam_misc"])
-	            )
-
-	if test "$pam_conv_function$with_libpam" = "noyes" ; then
-		AC_MSG_ERROR(PAM conversation function not found)
-	fi
-
-	pam_headers_found=no
-	AC_CHECK_HEADERS( [security/openpam.h security/pam_misc.h],
-	                 [ pam_headers_found=yes ; break ], [],
-	                 [ #include <security/pam_appl.h> ] )
-	if test "$pam_headers_found$with_libpam" = "noyes" ; then
-	                AC_MSG_ERROR(PAM headers not found)
-	fi
-
-
-	if test "$pam_lib$pam_headers_found" = "yesyes" -a "$pam_conv_function" != "no" ; then
-		with_libpam="yes"
-	else
-		with_libpam="no"
-		unset LIBPAM
-	fi
-fi
-dnl Now with_libpam is either yes or no
-if test "$with_libpam" = "yes"; then
-	AC_CHECK_DECLS([PAM_ESTABLISH_CRED,
-	                PAM_DELETE_CRED,
-	                PAM_NEW_AUTHTOK_REQD,
-	                PAM_DATA_SILENT],
-	               [], [], [#include <security/pam_appl.h>])
-
-
-	save_libs=$LIBS
-	LIBS="$LIBS $LIBPAM"
-	# We do not use AC_CHECK_FUNCS to avoid duplicated definition with
-	# Linux PAM.
-	AC_CHECK_FUNC(pam_fail_delay, [AC_DEFINE(HAS_PAM_FAIL_DELAY, 1, [Define to 1 if you have the declaration of 'pam_fail_delay'])])
-	LIBS=$save_libs
-
-	AC_DEFINE(USE_PAM, 1, [Define to support Pluggable Authentication Modules])
-	AC_DEFINE_UNQUOTED(SHADOW_PAM_CONVERSATION, [$pam_conv_function],[PAM converstation to use])
-	AM_CONDITIONAL(USE_PAM, [true])
-
-	AC_MSG_CHECKING(use login and su access checking if PAM not used)
-	AC_MSG_RESULT(no)
+AC_CHECK_HEADERS([sys/xattr.h attr/xattr.h],[break])
+if test x$ac_cv_header_attr_xattr_h = xyes
+then
+  AC_CHECK_LIB(attr, main, ATTR_LIB="-lattr", ATTR_LIB="")
 else
-	AC_DEFINE(SU_ACCESS, 1, [Define to support /etc/suauth su access control.])
-	AM_CONDITIONAL(USE_PAM, [false])
-	AC_MSG_CHECKING(use login and su access checking if PAM not used)
-	AC_MSG_RESULT(yes)
+  ATTR_LIB=""
+fi
+AC_SUBST(ATTR_LIB)
+BACKUP_LIBS=$LIBS
+LIBS="$LIBS $ATTR_LIB"
+AC_CHECK_FUNCS(llistxattr lgetxattr lsetxattr)
+LIBS=$BACKUP_LIBS
+
+AM_FUNC_GETLINE
+if test $am_cv_func_working_getline != yes; then
+  AC_CHECK_FUNCS(getdelim)
+else
+  AC_CHECK_FUNCS(getline)
 fi
 
-if test "$enable_acct_tools_setuid" != "no"; then
-	if test "$with_libpam" != "yes"; then
-		if test "$enable_acct_tools_setuid" = "yes"; then
-			AC_MSG_ERROR(PAM support is required for --enable-account-tools-setuid)
-		else
-			enable_acct_tools_setuid="no"
-		fi
-	else
-		enable_acct_tools_setuid="yes"
-	fi
-	if test "$enable_acct_tools_setuid" = "yes"; then
-		AC_DEFINE(ACCT_TOOLS_SETUID,
-		          1,
-		          [Define if account management tools should be installed setuid and authenticate the callers])
-	fi
-fi
-AM_CONDITIONAL(ACCT_TOOLS_SETUID, test "x$enable_acct_tools_setuid" = "xyes")
-
-AC_SUBST(LIBSKEY)
-AC_SUBST(LIBMD)
-if test "$with_skey" = "yes"; then
-	AC_CHECK_LIB(md, MD5Init, [LIBMD=-lmd])
-	AC_CHECK_LIB(skey, skeychallenge, [LIBSKEY=-lskey],
-		[AC_MSG_ERROR([liskey missing. You can download S/Key source code from http://rsync1.it.gentoo.org/gentoo/distfiles/skey-1.1.5.tar.bz2])])
-	AC_DEFINE(SKEY, 1, [Define to support S/Key logins.])
-	AC_TRY_COMPILE([
-		#include <stdio.h>
-		#include <skey.h>
-	],[
-		skeychallenge((void*)0, (void*)0, (void*)0, 0);
-	],[AC_DEFINE(SKEY_BSD_STYLE, 1, [Define to support newer BSD S/Key API])])
+# Check if we should build with GnuSSL support.
+TLS_LIBS=""
+AC_ARG_ENABLE(ssl, [  --disable-gnutls         disable GnuTLS support])
+if test "$enable_gnutls" \!= "no" ; then
+  AC_CHECK_LIB(gnutls, gnutls_init, TLS_LIBS="-lgnutls", TLS_LIBS="")
 fi
 
-if test "$enable_utmpx" = "yes"; then
-	if test "$ac_cv_header_utmpx_h" != "yes"; then
-		AC_MSG_ERROR([The utmpx.h header file is required for utmpx support.])
-	fi
-	AC_DEFINE(USE_UTMPX,
-	          1,
-	          [Define if utmpx should be used])
+if test -z "$TLS_LIBS" ; then
+  # Check if we should build with OpenSSL support.
+  SSL_LIBS=""
+  AC_ARG_ENABLE(ssl, [  --disable-ssl           disable SSL/TSL support])
+  if test "$enable_ssl" \!= "no"; then
+    AC_CHECK_LIB(ssl, SSL_connect, SSL_LIBS="-lssl -lcrypto", AC_MSG_ERROR([OpenSSL or GnuTLS are required]))
+    AC_SUBST(SSL_LIBS)
+  fi
+  TLS_LIBS=$SSL_LIBS
+else
+  AC_DEFINE(USE_GNUTLS, 1, [Enable GnuTLS support])
+  BACKUP_LIBS=$LIBS
+  LIBS="$LIBS $TLS_LIBS"
+  AC_CHECK_FUNCS(gnutls_certificate_verify_peers2 gnutls_pk_algorithm_get_name)
+  LIBS="$BACKUP_LIBS"
+fi
+AC_SUBST(TLS_LIBS)
+
+
+AC_ARG_ENABLE(ldap, [  --disable-ldap          disable LDAP support])
+AC_ARG_WITH(ldap-lib, [  --with-ldap-lib=type    select ldap library [auto|netscape5|netscape4|netscape3|umich|openldap]])
+AC_ARG_WITH(ldap-dir, [  --with-ldap-dir=DIR     base directory of ldap SDK])
+AC_ARG_WITH(ldap-conf-file, [  --with-ldap-conf-file     path to LDAP configuration file], [AC_DEFINE_UNQUOTED(LDAP_PATH_CONF, "$with_ldap_conf_file", [Path to ldap.conf file])], [AC_DEFINE_UNQUOTED(LDAP_PATH_CONF, "/etc/ldap.conf")])
+AC_ARG_WITH(ldap-secret-file, [  --with-ldap-secret-file   path to LDAP root secret file], [AC_DEFINE_UNQUOTED(LDAP_PATH_ROOTPASSWD, "$with_ldap_secret_file",[Path to ldap.secrets file])], [AC_DEFINE_UNQUOTED(LDAP_PATH_ROOTPASSWD, "/etc/ldap.secret")])
+
+if test "$enable_ldap" \!= "no"; then
+  AC_DEFINE(USE_LDAP, 1, [Enable LDAP support])
+
+  AC_CHECK_HEADERS(lber.h)
+  AC_CHECK_HEADERS(ldap.h, , AC_MSG_ERROR(could not locate <ldap.h>))
+  AC_CHECK_HEADERS(ldap_ssl.h)
+
+  dnl check which ldap library we have
+  if test -z "$with_ldap_lib"; then
+    with_ldap_lib=auto
+  fi
+
+  dnl from the pam_ldap configure script
+  if test -z "$found_ldap_lib" -a \( $with_ldap_lib = auto -o $with_ldap_lib = umich -o $with_ldap_lib = openldap \); then
+    AC_CHECK_LIB(lber, main, LDAP_LIBS="-llber")
+    AC_CHECK_LIB(ldap, main, LDAP_LIBS="-lldap $LDAP_LIBS" found_ldap_lib=yes,,$LDAP_LIBS)
+  fi
+
+  if test -z "$found_ldap_lib" -a \( $with_ldap_lib = auto -o $with_ldap_lib = netscape5 \); then
+    AC_CHECK_LIB(ldap50, main, LDAP_LIBS="-lldap50 -lssldap50 -lssl3 -lnss3 -lnspr4 -lprldap50 -lplc4 -lplds4" found_ldap_lib=yes need_pthread=true,, -lpthread)
+  fi
+  if test -z "$found_ldap_lib" -a \( $with_ldap_lib = auto -o $with_ldap_lib = netscape4 \); then
+    AC_CHECK_LIB(ldapssl41, main, LDAP_LIBS="-lldapssl41 -lplc3 -lplds3 -lnspr3" found_ldap_lib=yes need_pthread=true,, -lpthread)
+    if test -z "$found_ldap_lib"; then
+      AC_CHECK_LIB(ldapssl40, main, LDAP_LIBS="-lldapssl40" found_ldap_lib=yes need_pthread=true,, -lpthread)
+    fi
+  fi
+  if test -z "$found_ldap_lib" -a \( $with_ldap_lib = auto -o $with_ldap_lib = netscape3 \); then
+    AC_CHECK_LIB(ldapssl30, main, LDAP_LIBS="-lldapssl30" found_ldap_lib=yes need_pthread=true,, -lpthread)
+  fi
+  if test -z "$found_ldap_lib"; then
+    AC_MSG_ERROR(could not locate a valid LDAP library)
+  fi
+  AC_SUBST(LDAP_LIBS)
+  if test "$need_pthread" = "true"; then
+    AC_CHECK_LIB(pthread, main)
+  fi
+
+  dnl Save old LIBS variable and add LDAP libraries
+  BACKUP_LIBS=$LIBS
+  LIBS="$LDAP_LIBS $LIBS"
+
+  AC_CHECK_FUNCS(ldap_init ldap_get_lderrno ldap_parse_result ldap_memfree ldap_controls_free ldap_set_option ldap_get_option)
+  if test "$enable_ssl" \!= "no"; then
+    AC_CHECK_FUNCS(ldapssl_init ldap_start_tls_s ldap_pvt_tls_set_option)
+  fi
+  AC_CHECK_FUNCS(ldap_initialize)
+
+  AC_CHECK_FUNCS(ldap_set_rebind_proc)
+  AC_CACHE_CHECK(whether ldap_set_rebind_proc takes 3 arguments, pam_ldap_cv_ldap_set_rebind_proc, [
+  AC_TRY_COMPILE([
+#include <lber.h>
+#include <ldap.h>], [ldap_set_rebind_proc(0, 0, 0);], [pam_ldap_cv_ldap_set_rebind_proc=3], [pam_ldap_cv_ldap_set_rebind_proc=2]) ])
+  AC_DEFINE_UNQUOTED(LDAP_SET_REBIND_PROC_ARGS, $pam_ldap_cv_ldap_set_rebind_proc, ["Define to the number of arguments to ldap_set_rebindproc"])
+
+  dnl restore old LIBS variable
+  LIBS=$BACKUP_LIBS
+else
+  AC_CHECK_LIB(dl,dlopen,
+        [LDAP_LIBS="-ldl"],
+        [LDAP_LIBS=""])
+  AC_SUBST(LDAP_LIBS)
 fi
 
-AC_DEFINE_UNQUOTED(SHELL, ["$SHELL"], [The default shell.])
+AC_CHECK_HEADERS(libnscd.h)
+AC_CHECK_LIB(nscd,nscd_flush_cache, NSCD_LIB="-lnscd", NSCD_LIB="")
+AC_SUBST(NSCD_LIB)
+BACKUP_LIBS=$LIBS
+LIBS="$LIBS $NSCD_LIB"
+AC_CHECK_FUNCS(nscd_flush_cache)
+LIBS=$BACKUP_LIBS
 
-AM_GNU_GETTEXT_VERSION(0.16)
-AM_GNU_GETTEXT([external], [need-ngettext])
-AM_CONDITIONAL(USE_NLS, test "x$USE_NLS" = "xyes")
+dnl internationalization macros
+AM_GNU_GETTEXT_VERSION
+AM_GNU_GETTEXT([external])
 
-AC_CONFIG_FILES([
-	Makefile
-	po/Makefile.in
-	doc/Makefile
-	man/Makefile
-	man/config.xml
-	man/po/Makefile.in
-	man/cs/Makefile
-	man/de/Makefile
-	man/es/Makefile
-	man/fi/Makefile
-	man/fr/Makefile
-	man/hu/Makefile
-	man/id/Makefile
-	man/it/Makefile
-	man/ja/Makefile
-	man/ko/Makefile
-	man/pl/Makefile
-	man/pt_BR/Makefile
-	man/ru/Makefile
-	man/sv/Makefile
-	man/tr/Makefile
-	man/zh_CN/Makefile
-	man/zh_TW/Makefile
-	libmisc/Makefile
-	lib/Makefile
-	src/Makefile
-	contrib/Makefile
-	etc/Makefile
-	etc/pam.d/Makefile
-	shadow.spec
-])
-AC_OUTPUT
+AC_CHECK_HEADERS(dirent.h)
 
-echo
-echo "shadow will be compiled with the following features:"
-echo
-echo "	auditing support:		$with_audit"
-echo "	CrackLib support:		$with_libcrack"
-echo "	PAM support:			$with_libpam"
-if test "$with_libpam" = "yes"; then
-echo "	suid account management tools:	$enable_acct_tools_setuid"
+AC_CHECK_FUNCS(getusershell strftime)
+
+dnl Check for BioAPI interface
+AC_DEFINE([UNIX], [], [Define UNIX for BioAPI])
+AC_CHECK_HEADERS(bioapi.h bioapi_util.h)
+AC_CHECK_LIB([bioapi100], [BioAPI_Init], BIOAPI_LIB="-lbioapi100", BIOAPI_LIB="")
+AC_SUBST(BIOAPI_LIB)
+
+AC_OUTPUT(Makefile etc/Makefile lib/Makefile src/Makefile plugins/Makefile po/Makefile.in m4/Makefile )
+
+if test "$NSCD_LIB" == "" ; then
+   AC_MSG_WARN([libnscd not found, cannot flush nscd tables!])
 fi
-echo "	SELinux support:		$with_selinux"
-echo "	shadow group support:		$enable_shadowgrp"
-echo "	S/Key support:			$with_skey"
-echo "	SHA passwords encryption:	$with_sha_crypt"
-echo "	nscd support:			$with_nscd"
-echo

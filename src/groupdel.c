@@ -1,433 +1,406 @@
-/*
- * Copyright (c) 1991 - 1994, Julianne Frances Haugh
- * Copyright (c) 1996 - 2000, Marek Michałkiewicz
- * Copyright (c) 2000 - 2006, Tomasz Kłoczko
- * Copyright (c) 2007 - 2008, Nicolas François
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The name of the copyright holders or contributors may not be used to
- *    endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+/* Copyright (C) 2003, 2004, 2005 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@suse.de>
 
-#include <config.h>
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
 
-#ident "$Id: groupdel.c 2851 2009-04-30 21:39:38Z nekral-guest $"
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
 
-#include <ctype.h>
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <time.h>
+#include <utmp.h>
 #include <fcntl.h>
-#include <grp.h>
-#include <pwd.h>
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-#include "pam_defs.h"
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
+#include <paths.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
-#include <sys/types.h>
-#include "defines.h"
-#include "groupio.h"
-#include "nscd.h"
-#include "prototypes.h"
-#ifdef	SHADOWGRP
-#include "sgroupio.h"
-#endif
-/*
- * Global variables
- */
-char *Prog;
-
-static char *group_name;
-static gid_t group_id = -1;
-
-#ifdef	SHADOWGRP
-static bool is_shadow_grp;
+#include <getopt.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <libgen.h>
+#include <sys/resource.h>
+#ifdef HAVE_LIBNSCD_H
+#include <libnscd.h>
 #endif
 
-/*
- * exit status values
- */
-/*@-exitarg@*/
-#define E_SUCCESS	0	/* success */
-#define E_USAGE		2	/* invalid command syntax */
-#define E_NOTFOUND	6	/* specified group doesn't exist */
-#define E_GROUP_BUSY	8	/* can't remove user's primary group */
-#define E_GRP_UPDATE	10	/* can't update group file */
+#ifdef USE_LDAP
+#include "libldap.h"
+#endif
 
-/* local function prototypes */
-static void usage (void);
-static void grp_update (void);
-static void close_files (void);
-static void open_files (void);
-static void group_busy (gid_t);
+#include "i18n.h"
+#include "group.h"
+#include "public.h"
+#include "logging.h"
+#include "utf8conv.h"
+#include "logindefs.h"
+#include "read-files.h"
+#include "error_codes.h"
 
-/*
- * usage - display usage message and exit
- */
-static void usage (void)
+static void
+print_usage (FILE *stream, const char *program)
 {
-	fputs (_("Usage: groupdel group\n"), stderr);
-	exit (E_USAGE);
+  fprintf (stream, _("Usage: %s [-D binddn] [-P path] group\n"), program);
 }
 
-/*
- * grp_update - update group file entries
- *
- *	grp_update() writes the new records to the group files.
- */
-static void grp_update (void)
+static void
+print_help (const char *program)
 {
-	/*
-	 * To add the group, we need to update /etc/group.
-	 * Make sure failures will be reported.
-	 */
-	add_cleanup (cleanup_report_del_group_group, group_name);
-#ifdef	SHADOWGRP
-	if (is_shadow_grp) {
-		/* We also need to update /etc/gshadow */
-		add_cleanup (cleanup_report_del_group_gshadow, group_name);
-	}
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - delete a group\n\n"), program);
+
+#ifdef USE_LDAP
+  fputs (_("  -D binddn      Use dn \"binddn\" to bind to the LDAP directory\n"),
+         stdout);
 #endif
-
-	/*
-	 * Delete the group entry.
-	 */
-	if (gr_remove (group_name) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot remove entry '%s' from %s\n"),
-		         Prog, group_name, gr_dbname ());
-		exit (E_GRP_UPDATE);
-	}
-
-#ifdef	SHADOWGRP
-	/*
-	 * Delete the shadow group entries as well.
-	 */
-	if (is_shadow_grp && (sgr_locate (group_name) != NULL)) {
-		if (sgr_remove (group_name) == 0) {
-			fprintf (stderr,
-			         _("%s: cannot remove entry '%s' from %s\n"),
-			         Prog, group_name, sgr_dbname ());
-			exit (E_GRP_UPDATE);
-		}
-	}
-#endif				/* SHADOWGRP */
+  fputs (_("  -P path        Search passwd, shadow and group file in \"path\"\n"),
+	 stdout);
+  fputs (_(" --service srv   Add account to nameservice 'srv'\n"), stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
+  fputs (_("Valid services for --service are: files, ldap\n"), stdout);
 }
 
-/*
- * close_files - close all of the files that were opened
- *
- *	close_files() closes all of the files that were opened for this
- *	new group.  This causes any modified entries to be written out.
- */
-static void close_files (void)
+static const char *program = "groupdel";
+
+static struct option long_options[] = {
+#ifdef USE_LDAP
+  {"binddn",      required_argument, NULL, 'D' },
+#endif
+  {"force",       no_argument,       NULL, 'f'},
+  {"remove-home", no_argument,       NULL, 'r'},
+  {"path",        required_argument, NULL, 'P'},
+  {"version",     no_argument,       NULL, 'v'},
+  {"service",     required_argument, NULL, '\253'},
+  {"usage",       no_argument,       NULL, 'u'},
+  {"help",        no_argument,       NULL, '\255'},
+  {NULL, 0, NULL, '\0'}
+};
+static const char *short_options = "D:frP:uv";
+
+static struct passwd *
+files_getpwent (void)
 {
-	/* First, write the changes in the regular group database */
-	if (gr_close () == 0) {
-		fprintf (stderr,
-		         _("%s: failure while writing changes to %s\n"),
-		         Prog, gr_dbname ());
-		exit (E_GRP_UPDATE);
-	}
+  enum nss_status status;
+  static int buflen = 256;
+  static char *buffer = NULL;
+  static struct passwd resultbuf;
 
-#ifdef WITH_AUDIT
-	audit_logger (AUDIT_DEL_GROUP, Prog,
-	              "removing group from /etc/group",
-	              group_name, (unsigned int) group_id,
-	              SHADOW_AUDIT_SUCCESS);
-#endif
-	SYSLOG ((LOG_INFO,
-	         "group '%s' removed from %s",
-	         group_name, gr_dbname ()));
-	del_cleanup (cleanup_report_del_group_group);
+  if (buffer == NULL)
+    buffer = malloc (buflen);
 
-	cleanup_unlock_group (NULL);
-	del_cleanup (cleanup_unlock_group);
-
-
-	/* Then, write the changes in the shadow database */
-#ifdef	SHADOWGRP
-	if (is_shadow_grp) {
-		if (sgr_close () == 0) {
-			fprintf (stderr,
-			         _("%s: failure while writing changes to %s\n"),
-			         Prog, sgr_dbname ());
-			exit (E_GRP_UPDATE);
-		}
-
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_GROUP, Prog,
-		              "removing group from /etc/gshadow",
-		              group_name, (unsigned int) group_id,
-		              SHADOW_AUDIT_SUCCESS);
-#endif
-		SYSLOG ((LOG_INFO,
-		         "group '%s' removed from %s",
-		         group_name, sgr_dbname ()));
-		del_cleanup (cleanup_report_del_group_gshadow);
-
-		cleanup_unlock_gshadow (NULL);
-		del_cleanup (cleanup_unlock_gshadow);
-	}
-#endif				/* SHADOWGRP */
-
-	/* Report success at the system level */
-#ifdef WITH_AUDIT
-	audit_logger (AUDIT_DEL_GROUP, Prog,
-	              "",
-	              group_name, (unsigned int) group_id,
-	              SHADOW_AUDIT_SUCCESS);
-#endif
-	SYSLOG ((LOG_INFO, "group '%s' removed\n", group_name));
-	del_cleanup (cleanup_report_del_group);
+  while ((status = files_getpwent_r (&resultbuf, buffer, buflen, &errno))
+	 == NSS_STATUS_TRYAGAIN && errno == ERANGE)
+    {
+      errno = 0;
+      buflen += 256;
+      buffer = realloc (buffer, buflen);
+    }
+  if (status == NSS_STATUS_SUCCESS)
+    return &resultbuf;
+  else
+    return NULL;
 }
 
-/*
- * open_files - lock and open the group files
- *
- *	open_files() opens the two group files.
- */
-static void open_files (void)
+static int
+is_primary_group (gid_t gid, int have_extrapath)
 {
-	/* First, lock the databases */
-	if (gr_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, gr_dbname ());
-		exit (E_GRP_UPDATE);
-	}
-	add_cleanup (cleanup_unlock_group, NULL);
-#ifdef	SHADOWGRP
-	if (is_shadow_grp) {
-		if (sgr_lock () == 0) {
-			fprintf (stderr,
-			         _("%s: cannot lock %s; try again later.\n"),
-			         Prog, sgr_dbname ());
-			exit (E_GRP_UPDATE);
-		}
-		add_cleanup (cleanup_unlock_gshadow, NULL);
-	}
-#endif
+  struct passwd *pw;
+  int retval = 0;
 
-	/*
-	 * Now, if the group is not removed, it's our fault.
-	 * Make sure failures will be reported.
-	 */
-	add_cleanup (cleanup_report_del_group, group_name);
+  setpwent ();
 
-	/* An now open the databases */
-	if (gr_open (O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"),
-		         Prog, gr_dbname ());
-		SYSLOG ((LOG_WARN, "cannot open %s", gr_dbname ()));
-		exit (E_GRP_UPDATE);
-	}
-#ifdef	SHADOWGRP
-	if (is_shadow_grp) {
-		if (sgr_open (O_RDWR) == 0) {
-			fprintf (stderr,
-			         _("%s: cannot open %s\n"),
-			         Prog, sgr_dbname ());
-			SYSLOG ((LOG_WARN, "cannot open %s", sgr_dbname ()));
-			exit (E_GRP_UPDATE);
-		}
-	}
-#endif				/* SHADOWGRP */
-}
-
-/*
- * group_busy - check if this is any user's primary group
- *
- *	group_busy verifies that this group is not the primary group
- *	for any user.  You must remove all users before you remove
- *	the group.
- */
-static void group_busy (gid_t gid)
-{
-	struct passwd *pwd;
-
-	/*
-	 * Nice slow linear search.
-	 */
-
-	setpwent ();
-
-	while ( ((pwd = getpwent ()) != NULL) && (pwd->pw_gid != gid) );
-
-	endpwent ();
-
-	/*
-	 * If pwd isn't NULL, it stopped because the gid's matched.
-	 */
-
-	if (pwd == (struct passwd *) 0) {
-		return;
-	}
-
-	/*
-	 * Can't remove the group.
-	 */
-	fprintf (stderr,
-	         _("%s: cannot remove the primary group of user '%s'\n"),
-	         Prog, pwd->pw_name);
-	exit (E_GROUP_BUSY);
-}
-
-/*
- * main - groupdel command
- *
- *	The syntax of the groupdel command is
- *	
- *	groupdel group
- *
- *	The named group will be deleted.
- */
-
-int main (int argc, char **argv)
-{
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-	pam_handle_t *pamh = NULL;
-	int retval;
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
-
-#ifdef WITH_AUDIT
-	audit_help_open ();
-#endif
-	atexit (do_cleanups);
-
-	/*
-	 * Get my name so that I can use it to report errors.
-	 */
-
-	Prog = Basename (argv[0]);
-
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
-
-	if (argc != 2) {
-		usage ();
-	}
-
-	group_name = argv[1];
-
-	OPENLOG ("groupdel");
-
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
+  while ((pw = getpwent ()))
+    {
+      if (pw->pw_gid == gid)
 	{
-		struct passwd *pampw;
-		pampw = getpwuid (getuid ()); /* local, no need for xgetpwuid */
-		if (pampw == NULL) {
-			fprintf (stderr,
-			         _("%s: Cannot determine your user name.\n"),
-			         Prog);
-			exit (1);
-		}
-
-		retval = pam_start ("groupdel", pampw->pw_name, &conv, &pamh);
+	  fprintf (stderr,
+		   _("%s: GID `%u' is primary group of `%s'.\n"),
+		   program, (unsigned int) gid,
+		   utf8_to_locale (pw->pw_name));
+	  sec_log (program, MSG_GID_IS_PRIMARY_GROUP, (unsigned int) gid,
+		   pw->pw_name, getuid ());
+	  retval = 1;
 	}
+    }
 
-	if (PAM_SUCCESS == retval) {
-		retval = pam_authenticate (pamh, 0);
-	}
+  endpwent ();
 
-	if (PAM_SUCCESS == retval) {
-		retval = pam_acct_mgmt (pamh, 0);
-	}
-
-	if (NULL != pamh) {
-		(void) pam_end (pamh, retval);
-	}
-	if (PAM_SUCCESS != retval) {
-		fprintf (stderr, _("%s: PAM authentication failed\n"), Prog);
-		exit (1);
-	}
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
-
-#ifdef SHADOWGRP
-	is_shadow_grp = sgr_file_present ();
-#endif
-
+  if (have_extrapath)
+    while ((pw = files_getpwent ()))
+      {
+      if (pw->pw_gid == gid)
 	{
-		struct group *grp;
-		/*
-		 * Start with a quick check to see if the group exists.
-		 */
-		grp = getgrnam (group_name); /* local, no need for xgetgrnam */
-		if (NULL == grp) {
-			fprintf (stderr,
-			         _("%s: group '%s' does not exist\n"),
-			         Prog, group_name);
-			exit (E_NOTFOUND);
-		}
-
-		group_id = grp->gr_gid;
+	  fprintf (stderr,
+		   _("%s: GID `%u' is primary group of `%s'.\n"),
+		   program, (unsigned int) gid,
+		   utf8_to_locale (pw->pw_name));
+	  sec_log (program, MSG_GID_IS_PRIMARY_GROUP, (unsigned int) gid,
+		   pw->pw_name, getuid ());
+	  retval = 1;
 	}
+      }
 
-#ifdef	USE_NIS
-	/*
-	 * Make sure this isn't a NIS group
-	 */
-	if (__isgrNIS ()) {
-		char *nis_domain;
-		char *nis_master;
-
-		fprintf (stderr,
-		         _("%s: group '%s' is a NIS group\n"),
-		         Prog, group_name);
-
-		if (!yp_get_default_domain (&nis_domain) &&
-		    !yp_master (nis_domain, "group.byname", &nis_master)) {
-			fprintf (stderr,
-			         _("%s: %s is the NIS master\n"),
-			         Prog, nis_master);
-		}
-		exit (E_NOTFOUND);
-	}
-#endif
-
-	/*
-	 * Make sure this isn't the primary group of anyone.
-	 */
-	group_busy (group_id);
-
-	/*
-	 * Do the hard stuff - open the files, delete the group entries,
-	 * then close and update the files.
-	 */
-	open_files ();
-
-	grp_update ();
-
-	close_files ();
-
-	nscd_flush_cache ("group");
-
-	return E_SUCCESS;
+  return retval;
 }
 
+int
+main (int argc, char **argv)
+{
+  char *use_service = NULL;
+#ifdef USE_LDAP
+  char *binddn = NULL;
+#endif
+  char *remove_group;
+  int have_extrapath = 0;
+  group_t *gr_data;
+  int retval = E_SUCCESS;
+
+#ifdef ENABLE_NLS
+  setlocale (LC_ALL, "");
+  bindtextdomain (PACKAGE, LOCALEDIR);
+  textdomain (PACKAGE);
+#endif
+
+  /* Before going any further, raise the ulimit and ignore
+     signals.  */
+
+  init_environment ();
+
+  open_sec_log (program);
+
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+
+      c = getopt_long (argc, argv, short_options,
+		       long_options, &option_index);
+      if (c == (-1))
+	break;
+      switch (c)
+	{
+#ifdef USE_LDAP
+	case 'D':
+	  binddn = optarg;
+	  break;
+#endif
+	case 'P':
+	  files_etc_dir = strdup (optarg);
+	  have_extrapath = 1;
+	  /* If -P option is used, set service to "files" if not already
+	     set through an option. If we don't limitate to service files,
+	     we can get trouble finding the right source.  */
+	  if (!use_service)
+	    use_service = "files";
+	  break;
+	case '\253':
+	  if (use_service != NULL)
+            {
+              print_usage (stderr, program);
+              return E_BAD_ARG;
+            }
+
+          if (strcasecmp (optarg, "files") == 0)
+            use_service = "files";
+#ifdef USE_LDAP
+          else if (strcasecmp (optarg, "ldap") == 0)
+            use_service = "ldap";
+#endif
+          else
+            {
+              fprintf (stderr, _("Service `%s' not supported.\n"), optarg);
+              print_usage (stderr, program);
+              return E_BAD_ARG;
+            }
+	  break;
+	case '\255':
+	  print_help (program);
+	  return 0;
+	case 'u':
+	  print_usage (stdout, program);
+	  return 0;
+	case 'v':
+	  print_version (program, "2005");
+	  return 0;
+	default:
+	  print_error (program);
+	  return E_USAGE;
+	}
+    }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc > 1)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+  else if (argc == 0)
+    {
+      fprintf (stderr, _("%s: Too few arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+  else
+    {
+      int buflen = 256;
+      char *buffer = alloca (buflen);
+      struct passwd resultbuf;
+      struct passwd *pw;
+
+      /* Determine our own user name for PAM authentication.  */
+      while (getpwuid_r (getuid (), &resultbuf, buffer, buflen, &pw) != 0
+	     && errno == ERANGE)
+	{
+	  errno = 0;
+	  buflen += 256;
+	  buffer = alloca (buflen);
+	}
+
+      if (!pw)
+	{
+	  sec_log (program, MSG_NO_ACCOUNT_FOUND, getuid ());
+	  fprintf (stderr, _("%s: Cannot determine your user name.\n"),
+		   program);
+	  return E_NOTFOUND;
+	}
+
+      if (do_authentication ("shadow", pw->pw_name, NULL) != 0)
+	{
+          sec_log (program, MSG_PERMISSION_DENIED, pw->pw_name,
+                   pw->pw_uid, getuid());
+          return E_NOPERM;
+        }
+    }
+
+  remove_group = locale_to_utf8 (argv[0]);
+
+  gr_data = find_group_data (remove_group, 0, use_service);
+  if (gr_data == NULL || gr_data->service == S_NONE)
+    {
+      if (use_service)
+	fprintf (stderr, _("%s: Group `%s' not found in service `%s'.\n"),
+		 program, utf8_to_locale (remove_group), use_service);
+      else
+	fprintf (stderr, _("%s: Unknown group `%s'.\n"), program,
+		 utf8_to_locale (remove_group));
+
+      sec_log (program, MSG_UNKNOWN_GROUP, remove_group, getuid ());
+
+      return E_NOTFOUND;
+    }
+
+  if (is_primary_group (gr_data->gr.gr_gid, have_extrapath))
+    {
+      fprintf (stderr, _("%s: Cannot remove user's primary group.\n"),
+	       program);
+      sec_log (program, MSG_CANNOT_REMOVE_PRIMARY_GROUP,
+	       gr_data->gr.gr_name, getuid());
+      return E_GROUP_BUSY;
+    }
+
+#ifdef USE_LDAP
+  if (gr_data->service == S_LDAP)
+    {
+      if (binddn == NULL)
+	{
+	  binddn = get_caller_dn ();
+	  if (binddn == NULL)
+	    {
+	      fprintf (stderr, _("%s: Cannot delete group from LDAP database without DN.\n"),
+		       program);
+	    }
+	  else gr_data->binddn = strdup (binddn);
+	}
+      else
+	gr_data->binddn = strdup (binddn);
+
+      if (gr_data->oldclearpwd == NULL)
+	{
+	  char *cp = get_ldap_password (gr_data->binddn);
+
+	  if (cp)
+	    gr_data->oldclearpwd = strdup (cp);
+	  else
+	    {
+	      fprintf (stderr,
+		       _("%s: Group not deleted from LDAP database.\n"),
+		       program);
+	      return E_FAILURE;
+	    }
+	}
+    }
+#endif
+
+#if 0 /* XXX */
+  i = call_script ("GROUPDEL_PRECMD", pw_data->pw.pw_name, pw_data->pw.pw_uid,
+		   pw_data->pw.pw_gid, pw_data->pw.pw_dir);
+  if (i != 0)
+    {
+      fprintf (stderr, _("%s: GROUPDEL_PRECMD fails with exit code %d.\n"),
+	       program, i);
+      return E_FAILURE;
+    }
+#endif
+
+  /* Lock group file, so that a concurrent processes will not
+     use this group.  */
+  if (gr_data->service == S_LOCAL && lock_database () != 0)
+    {
+      fputs (_("Cannot lock group file: already locked.\n"), stderr);
+      sec_log (program, MSG_GROUP_FILE_ALREADY_LOCKED);
+      return E_PWDBUSY;
+    }
+
+  gr_data->todo = DO_DELETE;
+  if (write_group_data (gr_data, 1) != 0)
+    {
+      fprintf (stderr, _("%s: Error deleting group `%s'.\n"),
+	       program, utf8_to_locale (gr_data->gr.gr_name));
+      sec_log (program, MSG_ERROR_REMOVING_GROUP, gr_data->gr.gr_name,
+	       gr_data->gr.gr_gid, getuid ());
+      free_group_t (gr_data);
+      return E_FAILURE;
+    }
+  else
+    sec_log (program, MSG_GROUP_DELETED, gr_data->gr.gr_name,
+	     gr_data->gr.gr_gid, getuid ());
+
+#ifdef HAVE_NSCD_FLUSH_CACHE
+  /* flush NSCD cache to remove group really from the system.  */
+  nscd_flush_cache ("group");
+#endif
+
+  if (gr_data->service == S_LOCAL)
+    ulckpwdf ();
+
+#if 0 /* XXX */
+  i = call_script ("GROUPDEL_POSTCMD", pw_data->pw.pw_name, pw_data->pw.pw_uid,
+		   pw_data->pw.pw_gid, pw_data->pw.pw_dir);
+  if (i != 0)
+    {
+      fprintf (stderr, _("%s: GROUPDEL_POSTCMD fails with exit code %d.\n"),
+	       program, i);
+      return E_FAILURE;
+    }
+#endif
+
+  free_group_t (gr_data);
+
+  return retval;
+}

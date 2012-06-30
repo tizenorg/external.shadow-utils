@@ -1,416 +1,432 @@
-/*
-  vipw, vigr  edit the password or group file
-  with -s will edit shadow or gshadow file
- 
-  Copyright (c) 1997       , Guy Maor <maor@ece.utexas.edu>
-  Copyright (c) 1999 - 2000, Marek Michałkiewicz
-  Copyright (c) 2002 - 2006, Tomasz Kłoczko
-  Copyright (c) 2007 - 2008, Nicolas François
-  All rights reserved.
+/* Copyright (C) 2003, 2004, 2005 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@suse.de>
 
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; either version 2 of the License, or
-  (at your option) any later version.
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
 
-  This program is distributed in the hope that it will be useful, but
-  WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-  General Public License for more details.
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
 
-  You should have received a copy of the GNU General Public License
-  along with this program; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor,
-  Boston, MA 02110-1301, USA.  */
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
 
+
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 
-#ident "$Id: vipw.c 3006 2009-05-25 19:51:23Z nekral-guest $"
-
+#include <time.h>
+#include <paths.h>
 #include <errno.h>
-#include <getopt.h>
-#ifdef WITH_SELINUX                                                            
-#include <selinux/selinux.h>                                                   
-#endif
-#include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <fcntl.h>
+#include <string.h>
 #include <unistd.h>
-#include <utime.h>
-#include "defines.h"
-#include "groupio.h"
-#include "nscd.h"
-#include "prototypes.h"
-#include "pwio.h"
-#include "sgroupio.h"
-#include "shadowio.h"
-/*@-exitarg@*/
-#include "exitcodes.h"
+#include <signal.h>
+#include <getopt.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
 
-#define MSG_WARN_EDIT_OTHER_FILE _( \
-	"You have modified %s.\n"\
-	"You may need to modify %s for consistency.\n"\
-	"Please use the command '%s' to do so.\n")
+#include "i18n.h"
+#include "public.h"
+#include "error_codes.h"
 
-/*
- * Global variables
- */
-static const char *progname, *filename, *fileeditname;
-static bool filelocked = false;
-static bool createedit = false;
-static int (*unlock) (void);
-static bool quiet = false;
-
-/* local function prototypes */
-static void usage (void);
-static int create_backup_file (FILE *, const char *, struct stat *);
-static void vipwexit (const char *msg, int syserr, int ret);
-static void vipwedit (const char *, int (*)(void), int (*)(void));
-
-/*
- * usage - display usage message and exit
- */
-static void usage (void)
-{
-	(void) 
-	fputs (_("Usage: vipw [options]\n"
-	         "\n"
-	         "Options:\n"
-	         "  -g, --group                   edit group database\n"
-	         "  -h, --help                    display this help message and exit\n"
-	         "  -p, --passwd                  edit passwd database\n"
-	         "  -q, --quiet                   quiet mode\n"
-	         "  -s, --shadow                  edit shadow or gshadow database\n"
-	         "\n"), stderr);
-	exit (E_USAGE);
-}
-
-/*
- *
- */
-static int create_backup_file (FILE * fp, const char *backup, struct stat *sb)
-{
-	struct utimbuf ub;
-	FILE *bkfp;
-	int c;
-	mode_t mask;
-
-	mask = umask (077);
-	bkfp = fopen (backup, "w");
-	(void) umask (mask);
-	if (NULL == bkfp) {
-		return -1;
-	}
-
-	c = 0;
-	if (fseeko (fp, 0, SEEK_SET) == 0)
-		while ((c = getc (fp)) != EOF) {
-			if (putc (c, bkfp) == EOF) {
-				break;
-			}
-		}
-	if ((EOF != c) || (ferror (fp) != 0) || (fflush (bkfp) != 0)) {
-		fclose (bkfp);
-		unlink (backup);
-		return -1;
-	}
-	if (fsync (fileno (bkfp)) != 0) {
-		(void) fclose (bkfp);
-		unlink (backup);
-		return -1;
-	}
-	if (fclose (bkfp) != 0) {
-		unlink (backup);
-		return -1;
-	}
-
-	ub.actime = sb->st_atime;
-	ub.modtime = sb->st_mtime;
-	if (   (utime (backup, &ub) != 0)
-	    || (chmod (backup, sb->st_mode) != 0)
-	    || (chown (backup, sb->st_uid, sb->st_gid) != 0)) {
-		unlink (backup);
-		return -1;
-	}
-	return 0;
-}
-
-/*
- *
- */
-static void vipwexit (const char *msg, int syserr, int ret)
-{
-	int err = errno;
-
-	if (createedit) {
-		if (unlink (fileeditname) != 0) {
-			fprintf (stderr, _("%s: failed to remove %s\n"), progname, fileeditname);
-			/* continue */
-		}
-	}
-	if (filelocked) {
-		if ((*unlock) () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), progname, fileeditname);
-			SYSLOG ((LOG_ERR, "failed to unlock %s", fileeditname));
-			/* continue */
-		}
-	}
-	if (NULL != msg) {
-		fprintf (stderr, "%s: %s", progname, msg);
-	}
-	if (0 != syserr) {
-		fprintf (stderr, ": %s", strerror (err));
-	}
-	(void) fputs ("\n", stderr);
-	if (!quiet) {
-		fprintf (stdout, _("%s: %s is unchanged\n"), progname,
-			 filename);
-	}
-	exit (ret);
-}
-
-#ifndef DEFAULT_EDITOR
-#define DEFAULT_EDITOR "vi"
+#ifndef _PATH_PASSWD
+#define _PATH_PASSWD "/etc/passwd"
 #endif
 
-/*
- *
- */
+#ifndef _PATH_GROUP
+#define _PATH_GROUP "/etc/group"
+#endif
+
+#ifndef _PATH_SHADOW
+#define _PATH_SHADOW "/etc/shadow"
+#endif
+
+#ifndef _PATH_GSHADOW
+#define _PATH_GSHADOW "/etc/gshadow"
+#endif
+
 static void
-vipwedit (const char *file, int (*file_lock) (void), int (*file_unlock) (void))
+print_usage (FILE *stream, const char *program)
 {
-	const char *editor;
-	pid_t pid;
-	struct stat st1, st2;
-	int status;
-	FILE *f;
-	char filebackup[1024], fileedit[1024];
-
-	snprintf (filebackup, sizeof filebackup, "%s-", file);
-	snprintf (fileedit, sizeof fileedit, "%s.edit", file);
-	unlock = file_unlock;
-	filename = file;
-	fileeditname = fileedit;
-
-	if (access (file, F_OK) != 0) {
-		vipwexit (file, 1, 1);
-	}
-#ifdef WITH_SELINUX
-	/* if SE Linux is enabled then set the context of all new files
-	   to be the context of the file we are editing */
-	if (is_selinux_enabled ()) {
-		security_context_t passwd_context=NULL;
-		int ret = 0;
-		if (getfilecon (file, &passwd_context) < 0) {
-			vipwexit (_("Couldn't get file context"), errno, 1);
-		}
-		ret = setfscreatecon (passwd_context);
-		freecon (passwd_context);
-		if (0 != ret) {
-			vipwexit (_("setfscreatecon () failed"), errno, 1);
-		}
-	}
-#endif
-	if (file_lock () == 0) {
-		vipwexit (_("Couldn't lock file"), errno, 5);
-	}
-	filelocked = true;
-
-	/* edited copy has same owners, perm */
-	if (stat (file, &st1) != 0) {
-		vipwexit (file, 1, 1);
-	}
-	f = fopen (file, "r");
-	if (NULL == f) {
-		vipwexit (file, 1, 1);
-	}
-	if (create_backup_file (f, fileedit, &st1) != 0) {
-		vipwexit (_("Couldn't make backup"), errno, 1);
-	}
-	(void) fclose (f);
-	createedit = true;
-
-	editor = getenv ("VISUAL");
-	if (NULL == editor) {
-		editor = getenv ("EDITOR");
-	}
-	if (NULL == editor) {
-		editor = DEFAULT_EDITOR;
-	}
-
-	pid = fork ();
-	if (-1 == pid) {
-		vipwexit ("fork", 1, 1);
-	} else if (0 == pid) {
-		/* use the system() call to invoke the editor so that it accepts
-		   command line args in the EDITOR and VISUAL environment vars */
-		char *buf;
-
-		buf = (char *) malloc (strlen (editor) + strlen (fileedit) + 2);
-		snprintf (buf, strlen (editor) + strlen (fileedit) + 2,
-			  "%s %s", editor, fileedit);
-		if (system (buf) != 0) {
-			fprintf (stderr, "%s: %s: %s\n", progname, editor,
-				 strerror (errno));
-			exit (1);
-		} else {
-			exit (0);
-		}
-	}
-
-	for (;;) {
-		pid = waitpid (pid, &status, WUNTRACED);
-		if ((pid != -1) && (WIFSTOPPED (status) != 0)) {
-			/* The child (editor) was suspended.
-			 * Suspend vipw. */
-			kill (getpid (), WSTOPSIG(status));
-			/* wake child when resumed */
-			kill (pid, SIGCONT);
-		} else {
-			break;
-		}
-	}
-
-	if (   (-1 == pid)
-	    || (WIFEXITED (status) == 0)
-	    || (WEXITSTATUS (status) != 0)) {
-		vipwexit (editor, 1, 1);
-	}
-
-	if (stat (fileedit, &st2) != 0) {
-		vipwexit (fileedit, 1, 1);
-	}
-	if (st1.st_mtime == st2.st_mtime) {
-		vipwexit (0, 0, 0);
-	}
-#ifdef WITH_SELINUX                                                            
-	/* unset the fscreatecon */                                             
-	if (is_selinux_enabled ()) {
-		if (setfscreatecon (NULL)) {
-			vipwexit (_("setfscreatecon () failed"), errno, 1);
-		}
-	}
-#endif
-
-	/*
-	 * XXX - here we should check fileedit for errors; if there are any,
-	 * ask the user what to do (edit again, save changes anyway, or quit
-	 * without saving). Use pwck or grpck to do the check.  --marekm
-	 */
-	createedit = false;
-	unlink (filebackup);
-	link (file, filebackup);
-	if (rename (fileedit, file) == -1) {
-		fprintf (stderr,
-		         _("%s: can't restore %s: %s (your changes are in %s)\n"),
-		         progname, file, strerror (errno), fileedit);
-		vipwexit (0, 0, 1);
-	}
-
-	if ((*file_unlock) () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), progname, fileeditname);
-		SYSLOG ((LOG_ERR, "failed to unlock %s", fileeditname));
-		/* continue */
-	}
-	SYSLOG ((LOG_INFO, "file %s edited", fileeditname));
+  fprintf (stream, _("Usage: %s [-g|-p|-s]\n"),
+           program);
 }
 
-int main (int argc, char **argv)
+static void
+print_help (const char *program)
 {
-	bool editshadow = false;
-	char *a;
-	bool do_vipw;
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - edit the password, group or shadow file\n\n"),
+	   program);
 
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
+  fputs (_("  -g, --group    Edit the /etc/group file\n"), stdout);
+  fputs (_("  -p, --passwd   Edit the /etc/passwd file\n"), stdout);
+  fputs (_("  -s, --shadow   Edit the /etc/shadow file\n"), stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
+}
 
-	progname = ((a = strrchr (*argv, '/')) ? a + 1 : *argv);
-	do_vipw = (strcmp (progname, "vigr") != 0);
+static int
+call_editor (const char *file)
+{
+  char *editor;
+  pid_t pid;
 
-	OPENLOG (do_vipw ? "vipw" : "vigr");
+  if ((editor = getenv("EDITOR")) == NULL)
+    editor = strdup(_PATH_VI);
 
+  pid = fork();
+  if (pid < 0) /* Error */
+    {
+      fprintf (stderr, _("Cannot fork: %s\n"), strerror (errno));
+      return E_FAILURE;
+    }
+  else if (pid == 0) /* Child */
+    {
+      char *argp[] = {"sh", "-c", NULL, NULL};
+      char *buffer;
+      int i;
+
+      for (i = 3; i < getdtablesize (); i++)
+	close (i);
+
+      /* Reset all signals which parent ignores.  */
+      signal (SIGALRM, SIG_DFL);
+      signal (SIGXFSZ, SIG_DFL);
+      signal (SIGHUP, SIG_DFL);
+      signal (SIGINT, SIG_DFL);
+      signal (SIGPIPE, SIG_DFL);
+      signal (SIGQUIT, SIG_DFL);
+      signal (SIGTERM, SIG_DFL);
+      signal (SIGTSTP, SIG_DFL);
+      signal (SIGTTOU, SIG_DFL);
+
+      if (asprintf (&buffer, "%s %s", editor, file) < 0)
 	{
-		/*
-		 * Parse the command line options.
-		 */
-		int c;
-		static struct option long_options[] = {
-			{"group", no_argument, NULL, 'g'},
-			{"help", no_argument, NULL, 'h'},
-			{"passwd", no_argument, NULL, 'p'},
-			{"quiet", no_argument, NULL, 'q'},
-			{"shadow", no_argument, NULL, 's'},
-			{NULL, 0, NULL, '\0'}
-		};
-		while ((c =
-			getopt_long (argc, argv, "ghpqs",
-				     long_options, NULL)) != -1) {
-			switch (c) {
-			case 'g':
-				do_vipw = false;
-				break;
-			case 'h':
-				usage ();
-				break;
-			case 'p':
-				do_vipw = true;
-				break;
-			case 'q':
-				quiet = true;
-				break;
-			case 's':
-				editshadow = true;
-				break;
-			default:
-				usage ();
-			}
-		}
-	}
+	  fputs ("running out of memory!\n", stderr);
+	  return E_FAILURE;
+        }
+      argp[2] = buffer;
 
-	if (do_vipw) {
-		if (editshadow) {
-			vipwedit (SHADOW_FILE, spw_lock, spw_unlock);
-			printf (MSG_WARN_EDIT_OTHER_FILE,
-			        SHADOW_FILE,
-			        PASSWD_FILE,
-			        "vipw");
-		} else {
-			vipwedit (PASSWD_FILE, pw_lock, pw_unlock);
-			if (spw_file_present ()) {
-				printf (MSG_WARN_EDIT_OTHER_FILE,
-				        PASSWD_FILE,
-				        SHADOW_FILE,
-				        "vipw -s");
-			}
-		}
-	} else {
-#ifdef SHADOWGRP
-		if (editshadow) {
-			vipwedit (SGROUP_FILE, sgr_lock, sgr_unlock);
-			printf (MSG_WARN_EDIT_OTHER_FILE,
-			        SGROUP_FILE,
-			        GROUP_FILE,
-			        "vigr");
-		} else {
-#endif
-			vipwedit (GROUP_FILE, gr_lock, gr_unlock);
-#ifdef SHADOWGRP
-			if (sgr_file_present ()) {
-				printf (MSG_WARN_EDIT_OTHER_FILE,
-				        GROUP_FILE,
-				        SGROUP_FILE,
-				        "vigr -s");
-			}
-		}
-#endif
-	}
+      execv (_PATH_BSHELL, argp);
+      _exit (127);
+    }
+  else /* Parent */
+    {
+      int status;
 
-	nscd_flush_cache ("passwd");
-	nscd_flush_cache ("group");
+      while ((pid = waitpid (pid, &status, WUNTRACED)) > 0)
+	{
+	  /* the editor suspended, so suspend us as well */
+	  if (WIFSTOPPED (status))
+	    {
+	      kill (getpid (), SIGSTOP);
+	      kill (pid, SIGCONT);
+	    }
+	  else
+	    break;
+        }
 
-	return E_SUCCESS;
+      if (pid == -1 || !WIFEXITED (status) || WEXITSTATUS (status))
+	return E_FAILURE;
+    }
+
+  return 0;
 }
 
+static int
+edit (const char *file, const char *program, int shadow)
+{
+  struct stat before, after, orig;
+  int new_fd, old_fd;
+  char *tmpname;
+  int retval = 0;
+#ifdef WITH_SELINUX
+  security_context_t prev_context;
+#endif
+
+  if (asprintf (&tmpname, "%s.%sXXXXXX", file, program) < 0)
+    {
+      fputs ("running out of memory!\n", stderr);
+      return E_FAILURE;
+    }
+
+  if (lock_database () != 0)
+    {
+      fprintf (stderr, _("Cannot lock `%s': already locked.\n"), file);
+      return E_PWDBUSY;
+    }
+
+#ifdef WITH_SELINUX
+  if (set_default_context (file, &prev_context) < 0)
+    {
+      ulckpwdf ();
+      free (tmpname);
+      return E_FAILURE;
+    }
+#endif
+  new_fd = mkstemp (tmpname);
+#ifdef WITH_SELINUX
+  if (restore_default_context (prev_context) < 0)
+    {
+      if (new_fd >= 0)
+	close (new_fd);
+      ulckpwdf ();
+      free (tmpname);
+      return E_FAILURE;
+    }
+#endif
+  if (new_fd == -1)
+    {
+      fprintf (stderr, _("Can't create `%s': %m\n"), tmpname);
+      ulckpwdf ();
+      free (tmpname);
+      return E_FAILURE;
+    }
+  /* for the case somebody uses really an old glibc with
+     insecure mkstemp.  */
+  fchmod (new_fd, S_IRUSR|S_IWUSR);
+
+  old_fd = open (file, O_RDONLY);
+  if (old_fd == -1)
+    {
+      /* if the file does not exist, it could be that the
+	 user will create them.  */
+      if (errno != ENOENT)
+	{
+	  fprintf (stderr, "%s: %s\n", file, strerror (errno));
+	  close (new_fd);
+	  unlink (tmpname);
+	  ulckpwdf ();
+	  free (tmpname);
+	  return E_FAILURE;
+	}
+      /* Set orig struct for chmod/chown to usefull values for
+	 new files.  */
+      orig.st_uid = 0;
+      orig.st_gid = 0;
+      if (shadow)
+	orig.st_mode = S_IRUSR|S_IWUSR;
+      else
+	orig.st_mode = S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH;
+    }
+  else
+    {
+      char buffer[4096];
+      int cnt;
+
+      while ((cnt = read (old_fd, buffer, sizeof (buffer))) > 0)
+	{
+	  if (write (new_fd, buffer, cnt) != cnt)
+	    {
+	      fprintf (stderr, _("Cannot copy `%s': %s\n"),
+		       file, strerror (errno));
+	      cnt = -1;
+	      break;
+	    }
+	}
+      if (cnt < 0) /* Remove file if copy failed. */
+	{
+	  fprintf (stderr, _("Cannot copy `%s': %s\n"),
+		   file, strerror (errno));
+	  close (old_fd);
+	  close (new_fd);
+	  unlink (tmpname);
+	  ulckpwdf ();
+	  free (tmpname);
+	  return E_FAILURE;
+	}
+      if (fstat (old_fd, &orig))
+	{
+	  fprintf (stderr, _("Can't stat `%s': %m\n"), file);
+	  return E_FAILURE;
+	}
+      close (old_fd);
+    }
+  close (new_fd);
+
+  if (stat (tmpname, &before))
+    {
+      fprintf (stderr, _("Can't stat `%s': %m\n"), tmpname);
+      return E_FAILURE;
+    }
+
+  if (call_editor (tmpname) != 0)
+    {
+      unlink (tmpname);
+      free (tmpname);
+      ulckpwdf ();
+      return E_FAILURE;
+    }
+
+  if (stat (tmpname, &after))
+    {
+      fprintf (stderr, _("Can't stat `%s': %m\n"), tmpname);
+      return E_FAILURE;
+    }
+
+  if (before.st_mtime == after.st_mtime &&
+      before.st_size == after.st_size)
+    fprintf (stderr, _("%s: no changes made\n"), program);
+  else
+    {
+      char *old;
+
+      /* Set modes of temporary file to the from the original one.  */
+      if (chmod (tmpname, orig.st_mode) < 0)
+	{
+	  fprintf (stderr,
+		   _("Cannot change permissions for `%s': %s\n"),
+		   tmpname, strerror (errno));
+	  unlink (tmpname);
+	  return E_FAILURE;
+	}
+      if (chown (tmpname, orig.st_uid, orig.st_gid) < 0)
+	{
+	  fprintf (stderr,
+		   _("Cannot change owner/group for `%s': %s\n"),
+		   tmpname, strerror (errno));
+	  unlink (tmpname);
+	  return E_FAILURE;
+	}
+
+      if (copy_xattr (file, tmpname) != 0)
+	{
+	  unlink (tmpname);
+	  retval = E_FAILURE;
+	}
+      else if (asprintf (&old, "%s.old", file) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  unlink (tmpname);
+	  retval = E_FAILURE;
+	}
+      else
+	{
+	  /* Replace original file with edited one.  */
+	  unlink (old);
+	  if (link (file, old) < 0)
+	    fprintf (stderr,
+		     _("Warning: cannot create backup file: %m\n"));
+	  rename (tmpname, file);
+	}
+    }
+
+  ulckpwdf ();
+  free (tmpname);
+  return retval;
+}
+
+int
+main (int argc, char *argv[])
+{
+  char *program;
+  int vipw;
+  int shadow = 0;
+  char *cp;
+
+#ifdef ENABLE_NLS
+  setlocale(LC_ALL, "");
+  bindtextdomain(PACKAGE, LOCALEDIR);
+  textdomain(PACKAGE);
+#endif
+
+  /* Before going any further, raise the ulimit and ignore
+     signals.  */
+  init_environment ();
+
+  /* determine name of binary, which specifies edit mode.  */
+  program = ((cp = strrchr (*argv, '/')) ? cp + 1 : *argv);
+  if (strcmp (program, "vigr") == 0)
+    vipw = 0; /* Edit group file.  */
+  else
+    {
+      /* Edit passwd or shadow file. */
+      program = "vipw";
+      vipw = 1;
+    }
+
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+      static struct option long_options[] = {
+        {"group",   no_argument, NULL, 'g' },
+        {"passwd",  no_argument, NULL, 'p' },
+        {"shadow",  no_argument, NULL, 's' },
+        {"version", no_argument, NULL, 'v' },
+        {"usage",   no_argument, NULL, 'u' },
+        {"help",    no_argument, NULL, '\255' },
+        {NULL,      0,           NULL, '\0'}
+      };
+
+      c = getopt_long (argc, argv, "gpsVvu",
+                       long_options, &option_index);
+      if (c == (-1))
+        break;
+      switch (c)
+	{
+	case 'g':
+	  vipw = 0;
+	  break;
+	case 'p':
+	  vipw = 1;
+	  break;
+	case 's':
+	  /* Yes, vigr -s will edit gshadow, not shadow!
+	     Undocumented feature to be compatible with other
+	     implementations. */
+	  shadow = 1;
+	  break;
+	case '\255':
+          print_help (program);
+          return 0;
+	case 'V': /* RH compatibility.  */
+        case 'v':
+          print_version (program, "2005");
+          return 0;
+        case 'u':
+          print_usage (stdout, program);
+	  return 0;
+	default:
+	  print_error (program);
+	  return E_USAGE;
+	}
+    }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc > 0)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+
+  if (vipw)
+    {
+      if (shadow)
+	return edit (_PATH_SHADOW, program, shadow);
+      else
+	return edit (_PATH_PASSWD, program, shadow);
+    }
+  else
+    {
+      if (shadow)
+	return edit (_PATH_GSHADOW, program, shadow);
+      else
+	return edit (_PATH_GROUP, program, shadow);
+    }
+
+  /* never reached!  */
+  return E_FAILURE;
+}

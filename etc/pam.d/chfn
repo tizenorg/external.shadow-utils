@@ -1,4 +1,8 @@
 #%PAM-1.0
-auth		sufficient	pam_rootok.so
-account		required	pam_permit.so
-password	include		system-auth
+# For chfn command
+auth     sufficient	pam_rootok.so
+auth     include        common-auth
+account  include        common-account
+password include        common-password
+session  include        common-session
+

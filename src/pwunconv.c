@@ -1,201 +1,258 @@
-/*
- * Copyright (c) 1989 - 1994, Julianne Frances Haugh
- * Copyright (c) 1996 - 2000, Marek Michałkiewicz
- * Copyright (c) 2001 - 2005, Tomasz Kłoczko
- * Copyright (c) 2008       , Nicolas François
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The name of the copyright holders or contributors may not be used to
- *    endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+/* Copyright (C) 2004, 2005 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@suse.de>
 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
+
+
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 
-#ident "$Id: pwunconv.c 2852 2009-04-30 21:44:35Z nekral-guest $"
-
-#include <fcntl.h>
 #include <pwd.h>
+#include <time.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <stdio.h>
-#include <sys/types.h>
 #include <unistd.h>
-#include "defines.h"
-#include "nscd.h"
-#include "prototypes.h"
-#include "pwio.h"
-#include "shadowio.h"
+#include <string.h>
+#include <getopt.h>
+#include <sys/stat.h>
+#ifdef HAVE_LIBNSCD_H
+#include <libnscd.h>
+#endif
 
-/*
- * Global variables
- */
-char *Prog;
+#include "i18n.h"
+#include "public.h"
+#include "logindefs.h"
+#include "read-files.h"
+#include "error_codes.h"
 
-static bool spw_locked = false;
-static bool pw_locked = false;
-
-/* local function prototypes */
-static void fail_exit (int status);
-
-static void fail_exit (int status)
+static void
+print_usage (FILE *stream, const char *program)
 {
-	if (spw_locked) {
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-	}
-	if (pw_locked) {
-		if (pw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-			/* continue */
-		}
-	}
-	exit (status);
+  fprintf (stream, _("Usage: %s\n"), program);
 }
 
-
-int main (int argc, char **argv)
+static void
+print_help (const char *program)
 {
-	const struct passwd *pw;
-	struct passwd pwent;
-	const struct spwd *spwd;
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - convert from shadow account\n\n"),
+	   program);
 
-	if (1 != argc) {
-		(void) fputs (_("Usage: pwunconv\n"), stderr);
-	}
-	Prog = Basename (argv[0]);
-
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
-
-	OPENLOG ("pwunconv");
-
-	if (!spw_file_present ()) {
-		/* shadow not installed, do nothing */
-		exit (0);
-	}
-
-	if (pw_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, pw_dbname ());
-		fail_exit (5);
-	}
-	pw_locked = true;
-	if (pw_open (O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"),
-		         Prog, pw_dbname ());
-		fail_exit (1);
-	}
-
-	if (spw_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, spw_dbname ());
-		fail_exit (5);
-	}
-	spw_locked = true;
-	if (spw_open (O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"),
-		         Prog, spw_dbname ());
-		fail_exit (1);
-	}
-
-	pw_rewind ();
-	while ((pw = pw_next ()) != NULL) {
-		spwd = spw_locate (pw->pw_name);
-		if (NULL == spwd) {
-			continue;
-		}
-
-		pwent = *pw;
-
-		/*
-		 * Update password if non-shadow is "x".
-		 */
-		if (strcmp (pw->pw_passwd, SHADOW_PASSWD_STRING) == 0) {
-			pwent.pw_passwd = spwd->sp_pwdp;
-		}
-
-		/*
-		 * Password aging works differently in the two different
-		 * systems. With shadow password files you apparently must
-		 * have some aging information. The maxweeks or minweeks
-		 * may not map exactly. In pwconv we set max == 10000,
-		 * which is about 30 years. Here we have to undo that
-		 * kludge. So, if maxdays == 10000, no aging information is
-		 * put into the new file. Otherwise, the days are converted
-		 * to weeks and so on.
-		 */
-		if (pw_update (&pwent) == 0) {
-			fprintf (stderr,
-			         _("%s: failed to prepare the new %s entry '%s'\n"),
-			         Prog, pw_dbname (), pwent.pw_name);
-			fail_exit (3);
-		}
-	}
-
-	if (spw_close () == 0) {
-		fprintf (stderr,
-		         _("%s: failure while writing changes to %s\n"),
-		         Prog, spw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", spw_dbname ()));
-		fail_exit (3);
-	}
-
-	if (pw_close () == 0) {
-		fprintf (stderr,
-		         _("%s: failure while writing changes to %s\n"),
-		         Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", pw_dbname ()));
-		fail_exit (3);
-	}
-
-	if (unlink (SHADOW) != 0) {
-		fprintf (stderr,
-			 _("%s: cannot delete %s\n"), Prog, SHADOW);
-		SYSLOG ((LOG_ERR, "cannot delete %s", SHADOW));
-		fail_exit (3);
-	}
-
-	if (spw_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-		/* continue */
-	}
-	if (pw_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-		/* continue */
-	}
-
-	nscd_flush_cache ("passwd");
-
-	return 0;
+  fputs (_("  -P path        Search passwd and shadow file in \"path\"\n"),
+         stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
 }
 
+static struct spwd *
+files_getspent (void)
+{
+  enum nss_status status;
+  static int buflen = 256;
+  static char *buffer = NULL;
+  static struct spwd resultbuf;
+
+  if (buffer == NULL)
+    buffer = malloc (buflen);
+
+  while ((status = files_getspent_r (&resultbuf, buffer, buflen, &errno))
+         == NSS_STATUS_TRYAGAIN && errno == ERANGE)
+    {
+      errno = 0;
+      buflen += 256;
+      buffer = realloc (buffer, buflen);
+    }
+  if (status == NSS_STATUS_SUCCESS)
+    return &resultbuf;
+  else
+    return NULL;
+}
+
+int
+main (int argc, char *argv[])
+{
+  struct spwd *sp;
+  char *program;
+  char *cp;
+  char *tmppasswd = NULL;
+  char *shadow_path;
+
+#ifdef ENABLE_NLS
+  setlocale(LC_ALL, "");
+  bindtextdomain(PACKAGE, LOCALEDIR);
+  textdomain(PACKAGE);
+#endif
+
+  /* determine name of binary, which specifies edit mode.  */
+  program = ((cp = strrchr (*argv, '/')) ? cp + 1 : *argv);
+
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+      static struct option long_options[] = {
+	{"path",    required_argument, NULL, 'P'},
+        {"version", no_argument, NULL, 'v' },
+        {"usage",   no_argument, NULL, 'u' },
+        {"help",    no_argument, NULL, '\255' },
+        {NULL,      0,           NULL, '\0'}
+      };
+
+      c = getopt_long (argc, argv, "vuP:",
+                       long_options, &option_index);
+      if (c == (-1))
+        break;
+      switch (c)
+	{
+        case 'P':
+          files_etc_dir = strdup (optarg);
+	  break;
+	case '\255':
+          print_help (program);
+          return 0;
+        case 'v':
+          print_version (program, "2005");
+          return 0;
+        case 'u':
+          print_usage (stdout, program);
+	  return 0;
+	default:
+	  print_error (program);
+	  return E_USAGE;
+	}
+    }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc > 0)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+  else
+    {
+      /* Check, if /etc/shadow file exist. If not, exit.  */
+      char *path;
+      struct stat st;
+
+      if (asprintf (&shadow_path, "%s/shadow", files_etc_dir) < 0)
+        {
+          fputs ("running out of memory!\n", stderr);
+          return E_FAILURE;
+        }
+
+      if (lstat (shadow_path, &st) < 0)
+	{
+	  /* ENOENT means, the file does not exist and we have
+	     to create it. Else report an error and abort.  */
+	  if (errno == ENOENT)
+	    {
+	      fprintf (stderr, _("%s: No shadow file found.\n"),
+		       program);
+	      return E_FAILURE;
+	    }
+	  else
+	    {
+	      fprintf (stderr, _("Can't stat `%s': %m\n"), shadow_path);
+	      return E_FAILURE;
+	    }
+	}
+
+      /* Now create a copy of the original passwd file.  */
+      if (asprintf (&path, "%s/passwd", files_etc_dir) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  return E_FAILURE;
+	}
+      if (asprintf (&tmppasswd, "%s/passwd.pwunconv", files_etc_dir) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  return E_FAILURE;
+	}
+      if (link (path, tmppasswd) < 0)
+	{
+	  fprintf (stderr, _("Cannot create backup file `%s': %m\n"),
+		   tmppasswd);
+	  return E_FAILURE;
+	}
+      free (path);
+    }
+
+
+  /* Step through /etc/shadow and move the password into the passwd
+     file.  */
+  while ((sp = files_getspent ()) != NULL)
+    {
+      user_t *pw_data = do_getpwnam (sp->sp_namp, NULL);
+      /* Only change password in passwd file, if we have a
+	 corresponding passwd entry and this is 'x'.  */
+      if (pw_data != NULL && pw_data->service != S_NONE &&
+	  strcmp (pw_data->pw.pw_passwd, "x") == 0)
+	{
+	  /* Tell backend to ignore shadow file.  */
+	  pw_data->use_shadow = 0;
+	  pw_data->newpassword = strdup (sp->sp_pwdp);
+	  if (write_user_data (pw_data, 0) != 0)
+	    {
+	      fprintf (stderr,
+		       _("Error while moving password for `%s'.\n"),
+		       pw_data->pw.pw_name);
+	      free (pw_data);
+	      return E_FAILURE;
+	    }
+	}
+      free_user_t (pw_data);
+    }
+#ifdef HAVE_NSCD_FLUSH_CACHE
+  nscd_flush_cache ("passwd");
+#endif
+
+  /* Rename original shadow file to shadow.old.  */
+  {
+    char *oldshadow;
+    if (asprintf (&oldshadow, "%s/shadow.old", files_etc_dir) < 0)
+      {
+	fputs ("running out of memory!\n", stderr);
+	return E_FAILURE;
+      }
+    unlink (oldshadow);
+    rename (shadow_path, oldshadow);
+    free (oldshadow);
+    free (shadow_path);
+  }
+
+  /* Rename our own copy to passwd.old. As result, /etc/passwd.old
+     will have the contents of /etc/passwd when starting this program.  */
+  if (tmppasswd)
+    {
+      char *oldpasswd;
+
+      if (asprintf (&oldpasswd, "%s/passwd.old", files_etc_dir) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  return E_FAILURE;
+	}
+      unlink (oldpasswd);
+      rename (tmppasswd, oldpasswd);
+      free (oldpasswd);
+      free (tmppasswd);
+    }
+
+  return E_SUCCESS;
+}

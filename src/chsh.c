@@ -1,551 +1,584 @@
-/*
- * Copyright (c) 1989 - 1994, Julianne Frances Haugh
- * Copyright (c) 1996 - 2000, Marek Michałkiewicz
- * Copyright (c) 2001 - 2006, Tomasz Kłoczko
- * Copyright (c) 2007 - 2008, Nicolas François
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The name of the copyright holders or contributors may not be used to
- *    endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+/* Copyright (C) 2002, 2003, 2004, 2005 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@suse.de>
 
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
+
+
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 
-#ident "$Id: chsh.c 2851 2009-04-30 21:39:38Z nekral-guest $"
-
-#include <fcntl.h>
-#include <getopt.h>
 #include <pwd.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
-#include <sys/types.h>
+#include <signal.h>
+#include <syslog.h>
+#include <string.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <shadow.h>
 #ifdef WITH_SELINUX
 #include <selinux/selinux.h>
 #include <selinux/av_permissions.h>
 #endif
-#include "defines.h"
-#include "getdef.h"
-#include "nscd.h"
-#include "prototypes.h"
-#include "pwauth.h"
-#include "pwio.h"
-#ifdef USE_PAM
-#include "pam_defs.h"
+#ifdef HAVE_LIBNSCD_H
+#include <libnscd.h>
 #endif
-/*@-exitarg@*/
-#include "exitcodes.h"
 
-#ifndef SHELLS_FILE
-#define SHELLS_FILE "/etc/shells"
+#include "i18n.h"
+#include "public.h"
+#include "utf8conv.h"
+#include "logindefs.h"
+#include "read-files.h"
+#include "error_codes.h"
+
+#ifdef USE_LDAP
+#include "libldap.h"
 #endif
-/*
- * Global variables
- */
-char *Prog;		/* Program name */
-static bool amroot;		/* Real UID is root */
-static char loginsh[BUFSIZ];	/* Name of new login shell */
-/* command line options */
-static bool sflg = false;	/* -s - set shell from command line  */
-static bool pw_locked = false;
 
-/* external identifiers */
-
-/* local function prototypes */
-static void fail_exit (int code);
-static void usage (void);
-static void new_fields (void);
-static bool shell_is_listed (const char *);
-static bool is_restricted_shell (const char *);
-static void process_flags (int argc, char **argv);
-static void check_perms (const struct passwd *pw);
-static void update_shell (const char *user, char *loginsh);
-
-/*
- * fail_exit - do some cleanup and exit with the given error code
- */
-static void fail_exit (int code)
+static void
+print_usage (FILE *stream, const char *program)
 {
-	if (pw_locked) {
-		if (pw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-			/* continue */
-		}
-	}
-
-	closelog ();
-
-	exit (code);
+  fprintf (stream, _("Usage: %s [-D binddn] [-P path] [-s shell] [-l] [-q]\n            [--help] [--usage] [--version] [user]\n"),
+	   program);
 }
 
-/*
- * usage - print command line syntax and exit
- */
-static void usage (void)
+static void
+print_help (const char *program)
 {
-	fputs (_("Usage: chsh [options] [LOGIN]\n"
-	         "\n"
-	         "Options:\n"
-	         "  -h, --help                    display this help message and exit\n"
-	         "  -s, --shell SHELL             new login shell for the user account\n"
-	         "\n"), stderr);
-	exit (E_USAGE);
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - change login shell\n\n"), program);
+
+#ifdef USE_LDAP
+  fputs (_("  -D binddn      Use dn \"binddn\" to bind to the LDAP directory\n"),
+         stdout);
+#endif
+  fputs (_("  -P path        Search passwd and shadow file in \"path\"\n"),
+         stdout);
+  fputs (_("  -l             List allowed shells from /etc/shells\n"),
+         stdout);
+  fputs (_("  -s shell       Use 'shell' as new login shell\n"), stdout);
+  if (strcmp (program, "chsh") == 0)
+    fputs (_("  --service srv  Use nameservice 'srv'\n"), stdout);
+  fputs (_("  -q, --quiet    Don't be verbose\n"), stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
+
+  if (strcmp (program, "chsh") == 0)
+    fputs (_("Valid services are: files, nis, nisplus, ldap\n"),
+	   stdout);
 }
 
-/*
- * new_fields - change the user's login shell information interactively
- *
- * prompt the user for the login shell and change it according to the
- * response, or leave it alone if nothing was entered.
- */
-static void new_fields (void)
+/* If the given shell appears in /etc/shells, return 1. If not,
+   return 0. If the given shell is NULL, /etc/shells is outputted
+   to stdout. */
+static int
+get_shell_list (const char *shell_name)
 {
-	puts (_("Enter the new value, or press ENTER for the default"));
-	change_field (loginsh, sizeof loginsh, _("Login Shell"));
-}
-
-/*
- * is_restricted_shell - return true if the shell is restricted
- *
- */
-static bool is_restricted_shell (const char *sh)
-{
-	/*
-	 * Shells not listed in /etc/shells are considered to be restricted.
-	 * Changed this to avoid confusion with "rc" (the plan9 shell - not
-	 * restricted despite the name starting with 'r').  --marekm
-	 */
-	return !shell_is_listed (sh);
-}
-
-/*
- * shell_is_listed - see if the user's login shell is listed in /etc/shells
- *
- * The /etc/shells file is read for valid names of login shells.  If the
- * /etc/shells file does not exist the user cannot set any shell unless
- * they are root.
- *
- * If getusershell() is available (Linux, *BSD, possibly others), use it
- * instead of re-implementing it.
- */
-static bool shell_is_listed (const char *sh)
-{
-	char *cp;
-	bool found = false;
-
 #ifndef HAVE_GETUSERSHELL
-	char buf[BUFSIZ];
-	FILE *fp;
+  FILE *fp;
+  char buf[BUFSIZ];
+#else
+  char *buf;
+#endif
+  int found;
+  int len;
+
+  found = 0;
+
+#ifdef HAVE_GETUSERSHELL
+  setusershell();
+#else
+  fp = fopen ("/etc/shells", "r");
+  if (! fp)
+    {
+      if (! shell_name)
+	printf (_("No known shells.\n"));
+      return 1;
+    }
 #endif
 
 #ifdef HAVE_GETUSERSHELL
-	setusershell ();
-	while ((cp = getusershell ())) {
-		if (*cp == '#') {
-			continue;
-		}
-
-		if (strcmp (cp, sh) == 0) {
-			found = true;
-			break;
-		}
-	}
-	endusershell ();
+  while ((buf = getusershell ()))
 #else
-	fp = fopen (SHELLS_FILE, "r");
-	if (NULL == fp) {
-		return false;
-	}
-
-	while (fgets (buf, sizeof (buf), fp) == buf) {
-		cp = strrchr (buf, '\n');
-		if (NULL != cp) {
-			*cp = '\0';
-		}
-
-		if (buf[0] == '#') {
-			continue;
-		}
-
-		if (strcmp (buf, sh) == 0) {
-			found = true;
-			break;
-		}
-	}
-	fclose (fp);
+  while (fgets (buf, sizeof (buf), fp) != NULL)
 #endif
-	return found;
+    {
+      /* ignore comments */
+      if (*buf == '#')
+	continue;
+      len = strlen (buf);
+      /* strip the ending newline */
+      if (buf[len - 1] == '\n')
+	buf[len - 1] = 0;
+      /* check or output the shell */
+      if (shell_name)
+	{
+	  if (! strcmp (shell_name, buf))
+	    {
+	      found = 1;
+	      break;
+            }
+        }
+      else
+	printf ("%s\n", buf);
+    }
+#ifdef HAVE_GETUSERSHELL
+  endusershell();
+#else
+  fclose (fp);
+#endif
+  return found;
 }
 
-/*
- *  * process_flags - parse the command line options
- *
- *	It will not return if an error is encountered.
- */
-static void process_flags (int argc, char **argv)
+/* return 1 if the named shell begins with 'r' or 'R'
+   If the first letter of the filename is 'r' or 'R', the shell is
+   considered to be restricted. */
+static int
+restricted_shell (const char *sh)
 {
-	int option_index = 0;
-	int c;
-	static struct option long_options[] = {
-		{"help", no_argument, NULL, 'h'},
-		{"shell", required_argument, NULL, 's'},
-		{NULL, 0, NULL, '\0'}
+#if 0
+  char *cp = Basename((char *) sh);
+  return *cp == 'r' || *cp == 'R';
+#else
+  /* Shells not listed in /etc/shells are considered to be
+     restricted.  Changed this to avoid confusion with "rc"
+     (the plan9 shell - not restricted despite the name
+     starting with 'r'). */
+  return !get_shell_list (sh);
+#endif
+}
+
+/* If the shell is completely invalid, print an error and
+   return 1. If root changes the shell, print only a warning.
+   Only exception: Invalid characters are always not allowed.  */
+static int
+check_shell (const char *program, const char *shell)
+{
+  uid_t uid = getuid ();
+  size_t i;
+  int c;
+
+  if (*shell != '/')
+    {
+      fprintf (stderr, _("%s: Shell must be a full path name.\n"), program);
+      if (uid)
+	return 1;
+    }
+  if (access (shell, F_OK) < 0)
+    {
+      fprintf (stderr, _("%s: `%s' does not exist.\n"), program, shell);
+      if (uid)
+	return 1;
+    }
+  if (access (shell, X_OK) < 0)
+    {
+      fprintf (stderr, _("%s: `%s' is not executable.\n"), program, shell);
+      if (uid)
+	return 1;
+    }
+  /* keep /etc/passwd clean. */
+  for (i = 0; i < strlen (shell); i++)
+    {
+      c = shell[i];
+      if (c == ',' || c == ':' || c == '=' || c == '"' || c == '\n')
+	{
+	  fprintf (stderr, _("%s: '%c' is not allowed.\n"), program, c);
+	  return 1;
+        }
+      if (iscntrl (c))
+	{
+	  fprintf (stderr, _("%s: Control characters are not allowed.\n"),
+		   program);
+	  return 1;
+        }
+    }
+  if (! get_shell_list (shell))
+    {
+      if (uid == 0)
+	printf (_("Warning: \"%s\" is not listed in /etc/shells.\n"), shell);
+      else
+	{
+	  fprintf (stderr, _("%s: \"%s\" is not listed in /etc/shells.\n"),
+		   program, shell);
+	  fprintf (stderr, _("%s: Use -l option to see list.\n"), program);
+	  return 1;
+	}
+    }
+  return 0;
+}
+
+
+int
+main (int argc, char *argv[])
+{
+  uid_t uid = getuid ();
+  char *new_shell = NULL;
+  int l_flag = 0;
+  int silent = 0;
+  user_t *pw_data = NULL;
+  char *use_service = NULL;
+  char *caller_name = NULL;
+  char *locale_name;
+  const char *program = basename (argv[0]);
+#ifdef USE_LDAP
+  char *binddn = NULL;
+#endif
+
+#ifdef ENABLE_NLS
+  setlocale(LC_ALL, "");
+  bindtextdomain(PACKAGE, LOCALEDIR);
+  textdomain(PACKAGE);
+#endif
+
+  openlog (program, LOG_PID, LOG_AUTHPRIV);
+
+  /* Before going any further, raise the ulimit and ignore
+     signals.  */
+  init_environment ();
+
+  if (strcasecmp (program, "ypchsh") == 0)
+    use_service = "nis";
+  else if (strcasecmp (program, "chsh") != 0)
+    {
+      fprintf (stderr, _("%s: Don't know what I should do.\n"), program);
+      return 1;
+    }
+
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+      static struct option long_options[] =
+	{
+#ifdef USE_LDAP
+	  {"binddn",      required_argument, NULL, 'D' },
+#endif
+	  {"path",        required_argument, NULL, 'P' },
+	  {"shell",       required_argument, NULL, 's' },
+	  {"list-shells", no_argument,       NULL, 'l' },
+	  {"quiet",       no_argument,       NULL, 'q' },
+	  {"version",     no_argument,       NULL, 'v' },
+	  {"usage",       no_argument,       NULL, 'u' },
+	  {"service",     required_argument, NULL, '\254' },
+	  {"help",        no_argument,       NULL, '\255' },
+	  {NULL,          0,                 NULL, '\0'}
 	};
 
-	while ((c =
-		getopt_long (argc, argv, "hs:", long_options,
-		             &option_index)) != -1) {
-		switch (c) {
-		case 'h':
-			usage ();
-			break;
-		case 's':
-			sflg = true;
-			STRFCPY (loginsh, optarg);
-			break;
-		default:
-			usage ();
-		}
-	}
+      c = getopt_long (argc, argv, "D:P:s:r:lvuq",
+		       long_options, &option_index);
+      if (c == (-1))
+        break;
+      switch (c)
+        {
 
-	/*
-	 * There should be only one remaining argument at most and it should
-	 * be the user's name.
-	 */
-	if (argc > (optind + 1)) {
-		usage ();
-	}
-}
+        case 'l':
+	  l_flag = 1;
+	  break;
+        case 's':
+	  if (! optarg)
+	    {
+	      print_usage (stderr, program);
+	      return 1;
+            }
+	  new_shell = strdup (optarg);
+	  break;
+	case '\254':
+	  if (use_service != NULL)
+	    {
+	      print_usage (stderr, program);
+	      return 1;
+	    }
 
-/*
- * check_perms - check if the caller is allowed to add a group
- *
- *	Non-root users are only allowed to change their shell, if their current
- *	shell is not a restricted shell.
- *
- *	Non-root users must be authenticated.
- *
- *	It will not return if the user is not allowed.
- */
-static void check_perms (const struct passwd *pw)
-{
-#ifdef USE_PAM
-	pam_handle_t *pamh = NULL;
-	int retval;
-	struct passwd *pampw;
+	  if (strcasecmp (optarg, "yp") == 0 ||
+	      strcasecmp (optarg, "nis") == 0)
+	    use_service = "nis";
+	  else if (strcasecmp (optarg, "nis+") == 0 ||
+		   strcasecmp (optarg, "nisplus") == 0)
+	    use_service = "nisplus";
+	  else if (strcasecmp (optarg, "files") == 0)
+	    use_service = "files";
+#ifdef USE_LDAP
+	  else if (strcasecmp (optarg, "ldap") == 0)
+	    use_service = "ldap";
 #endif
-
-	/*
-	 * Non-privileged users are only allowed to change the shell if the
-	 * UID of the user matches the current real UID.
-	 */
-	if (!amroot && pw->pw_uid != getuid ()) {
-		SYSLOG ((LOG_WARN, "can't change shell for '%s'", pw->pw_name));
-		fprintf (stderr,
-		         _("You may not change the shell for '%s'.\n"),
-		         pw->pw_name);
-		fail_exit (1);
-	}
-
-	/*
-	 * Non-privileged users are only allowed to change the shell if it
-	 * is not a restricted one.
-	 */
-	if (!amroot && is_restricted_shell (pw->pw_shell)) {
-		SYSLOG ((LOG_WARN, "can't change shell for '%s'", pw->pw_name));
-		fprintf (stderr,
-		         _("You may not change the shell for '%s'.\n"),
-		         pw->pw_name);
-		fail_exit (1);
-	}
-#ifdef WITH_SELINUX
-	/*
-	 * If the UID of the user does not match the current real UID,
-	 * check if the change is allowed by SELinux policy.
-	 */
-	if ((pw->pw_uid != getuid ())
-	    && (is_selinux_enabled () > 0)
-	    && (selinux_check_passwd_access (PASSWD__CHSH) != 0)) {
-		SYSLOG ((LOG_WARN, "can't change shell for '%s'", pw->pw_name));
-		fprintf (stderr,
-		         _("You may not change the shell for '%s'.\n"),
-		         pw->pw_name);
-		fail_exit (1);
-	}
+	  else
+	    {
+	      fprintf (stderr, _("Service `%s' not supported.\n"), optarg);
+	      print_usage (stderr, program);
+	      return 1;
+	    }
+	  break;
+	case 'q':
+	  silent = 1;
+	  break;
+#ifdef USE_LDAP
+        case 'D':
+          binddn = optarg;
+          break;
 #endif
-
-#ifndef USE_PAM
-	/*
-	 * Non-privileged users are optionally authenticated (must enter
-	 * the password of the user whose information is being changed)
-	 * before any changes can be made. Idea from util-linux
-	 * chfn/chsh.  --marekm
-	 */
-	if (!amroot && getdef_bool ("CHSH_AUTH")) {
-		passwd_check (pw->pw_name, pw->pw_passwd, "chsh");
+        case 'P':
+          if (uid != 0)
+            {
+              fprintf (stderr,
+                       _("Only root is allowed to specify another path\n"));
+              return E_NOPERM;
+            }
+          else
+            files_etc_dir = strdup (optarg);
+          break;
+        case '\255':
+          print_help (program);
+          return 0;
+        case 'v':
+          print_version (program, "2005");
+          return 0;
+        case 'u':
+          print_usage (stdout, program);
+          return 0;
+        default:
+          print_error (program);
+          return 1;
         }
+    }
 
-#else				/* !USE_PAM */
-	pampw = getpwuid (getuid ()); /* local, no need for xgetpwuid */
-	if (NULL == pampw) {
-		fprintf (stderr,
-		         _("%s: Cannot determine your user name.\n"),
-		         Prog);
-		exit (E_NOPERM);
+  argc -= optind;
+  argv += optind;
+
+  if (argc > 1 || (l_flag && argc > 0))
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return 1;
+    }
+
+  if (l_flag && new_shell)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return 1;
+    }
+
+  if (l_flag)
+    {
+      get_shell_list (NULL);
+      return 0;
+    }
+  else
+    {
+      int buflen = 256;
+      char *buffer = alloca (buflen);
+      struct passwd resultbuf;
+      struct passwd *pw;
+
+      /* Determine our own user name for PAM authentication.  */
+      while (getpwuid_r (uid, &resultbuf, buffer, buflen, &pw) != 0
+	     && errno == ERANGE)
+	{
+	  errno = 0;
+	  buflen += 256;
+	  buffer = alloca (buflen);
+	}
+      if (!pw)
+	{
+	  fprintf (stderr, _("%s: Cannot determine your user name.\n"),
+		   program);
+	  return 1;
 	}
 
-	retval = pam_start ("chsh", pampw->pw_name, &conv, &pamh);
+      caller_name = strdupa (pw->pw_name);
 
-	if (PAM_SUCCESS == retval) {
-		retval = pam_authenticate (pamh, 0);
+      /* We change the passwd information for another user, get that
+	 data, too.  */
+      if (argc == 1)
+	{
+	  char *user = locale_to_utf8 (argv[0]);
+
+	  while (getpwnam_r (user, &resultbuf, buffer, buflen, &pw) != 0
+		 && errno == ERANGE)
+	    {
+	      errno = 0;
+	      buflen += 256;
+	      buffer = alloca (buflen);
+	    }
+
+	  free (user);
+	  if (!pw)
+	    {
+	      fprintf (stderr, _("%s: Unknown user `%s'.\n"),
+		       program, argv[0]);
+	      return 1;
+	    }
 	}
 
-	if (PAM_SUCCESS == retval) {
-		retval = pam_acct_mgmt (pamh, 0);
+      pw_data = do_getpwnam (pw->pw_name, use_service);
+      if (pw_data == NULL || pw_data->service == S_NONE)
+	{
+	  if (use_service)
+	    fprintf (stderr, _("%s: User `%s' is not known to service `%s'.\n"),
+		     program, utf8_to_locale (pw->pw_name), use_service);
+	  else
+	    fprintf (stderr, _("%s: Unknown user `%s'.\n"), program,
+		     utf8_to_locale (pw->pw_name));
+	  return 1;
 	}
 
-	if (NULL != pamh) {
-		(void) pam_end (pamh, retval);
-	}
-	if (PAM_SUCCESS != retval) {
-		fprintf (stderr, _("%s: PAM authentication failed\n"), Prog);
-		exit (E_NOPERM);
-	}
-#endif				/* USE_PAM */
-}
+      locale_name = utf8_to_locale (pw_data->pw.pw_name);
+    }
 
-/*
- * update_shell - update the user's shell in the passwd database
- *
- *	Commit the user's entry after changing her shell field.
- *
- *	It will not return in case of error.
- */
-static void update_shell (const char *user, char *newshell)
-{
-	const struct passwd *pw;	/* Password entry from /etc/passwd   */
-	struct passwd pwent;		/* New password entry                */
-
-	/*
-	 * Before going any further, raise the ulimit to prevent
-	 * colliding into a lowered ulimit, and set the real UID
-	 * to root to protect against unexpected signals. Any
-	 * keyboard signals are set to be ignored.
-	 */
-	if (setuid (0) != 0) {
-		SYSLOG ((LOG_ERR, "can't setuid(0)"));
-		fputs (_("Cannot change ID to root.\n"), stderr);
-		fail_exit (1);
-	}
-	pwd_init ();
-
-	/*
-	 * The passwd entry is now ready to be committed back to
-	 * the password file. Get a lock on the file and open it.
-	 */
-	if (pw_lock () == 0) {
-		fprintf (stderr, _("%s: cannot lock %s; try again later.\n"),
-		         Prog, pw_dbname ());
-		fail_exit (1);
-	}
-	pw_locked = true;
-	if (pw_open (O_RDWR) == 0) {
-		fprintf (stderr, _("%s: cannot open %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_WARN, "cannot open %s", pw_dbname ()));
-		fail_exit (1);
-	}
-
-	/*
-	 * Get the entry to update using pw_locate() - we want the real
-	 * one from /etc/passwd, not the one from getpwnam() which could
-	 * contain the shadow password if (despite the warnings) someone
-	 * enables AUTOSHADOW (or SHADOW_COMPAT in libc).  --marekm
-	 */
-	pw = pw_locate (user);
-	if (NULL == pw) {
-		fprintf (stderr,
-		         _("%s: user '%s' does not exist in %s\n"),
-		         Prog, user, pw_dbname ());
-		fail_exit (1);
-	}
-
-	/*
-	 * Make a copy of the entry, then change the shell field. The other
-	 * fields remain unchanged.
-	 */
-	pwent = *pw;
-	pwent.pw_shell = newshell;
-
-	/*
-	 * Update the passwd file entry. If there is a DBM file, update
-	 * that entry as well.
-	 */
-	if (pw_update (&pwent) == 0) {
-		fprintf (stderr,
-		         _("%s: failed to prepare the new %s entry '%s'\n"),
-		         Prog, pw_dbname (), pwent.pw_name);
-		fail_exit (1);
-	}
-
-	/*
-	 * Changes have all been made, so commit them and unlock the file.
-	 */
-	if (pw_close () == 0) {
-		fprintf (stderr, _("%s: failure while writing changes to %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", pw_dbname ()));
-		fail_exit (1);
-	}
-	if (pw_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-		/* continue */
-	}
-	pw_locked= false;
-}
-
-/*
- * chsh - this command controls changes to the user's shell
- *
- *	The only supported option is -s which permits the the login shell to
- *	be set from the command line.
- */
-int main (int argc, char **argv)
-{
-	char *user;		/* User name                         */
-	const struct passwd *pw;	/* Password entry from /etc/passwd   */
-
-	sanitize_env ();
-
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
-
-	/*
-	 * This command behaves different for root and non-root users.
-	 */
-	amroot = (getuid () == 0);
-
-	/*
-	 * Get the program name. The program name is used as a prefix to
-	 * most error messages.
-	 */
-	Prog = Basename (argv[0]);
-
-	OPENLOG ("chsh");
-
-	/* parse the command line options */
-	process_flags (argc, argv);
-
-	/*
-	 * Get the name of the user to check. It is either the command line
-	 * name, or the name getlogin() returns.
-	 */
-	if (optind < argc) {
-		user = argv[optind];
-		pw = xgetpwnam (user);
-		if (NULL == pw) {
-			fprintf (stderr,
-			         _("%s: user '%s' does not exist\n"), Prog, user);
-			fail_exit (1);
-		}
-	} else {
-		pw = get_my_pwent ();
-		if (NULL == pw) {
-			fprintf (stderr,
-			         _("%s: Cannot determine your user name.\n"),
-			         Prog);
-			SYSLOG ((LOG_WARN, "Cannot determine the user name of the caller (UID %lu)",
-			         (unsigned long) getuid ()));
-			fail_exit (1);
-		}
-		user = xstrdup (pw->pw_name);
-	}
-
-#ifdef	USE_NIS
-	/*
-	 * Now we make sure this is a LOCAL password entry for this user ...
-	 */
-	if (__ispwNIS ()) {
-		char *nis_domain;
-		char *nis_master;
-
-		fprintf (stderr,
-		         _("%s: cannot change user '%s' on NIS client.\n"),
-		         Prog, user);
-
-		if (!yp_get_default_domain (&nis_domain) &&
-		    !yp_master (nis_domain, "passwd.byname", &nis_master)) {
-			fprintf (stderr,
-			         _("%s: '%s' is the NIS master for this client.\n"),
-			         Prog, nis_master);
-		}
-		fail_exit (1);
-	}
+#ifdef WITH_SELINUX
+  if (is_selinux_enabled () > 0)
+    {
+      if ((uid == 0) &&
+          (selinux_check_access (pw_data->pw.pw_name, PASSWD__CHSH) != 0))
+        {
+          security_context_t user_context;
+          if (getprevcon (&user_context) < 0)
+            user_context =
+              (security_context_t) strdup (_("Unknown user context"));
+	  fprintf (stderr,
+		  _("%s: %s is not authorized to change the shell of `%s'.\n"),
+		   program, user_context, locale_name);
+	  if (security_getenforce() > 0)
+	    {
+	      syslog (LOG_ALERT,
+		      "%s is not authorized to change the shell of `%s'",
+		      user_context, pw_data->pw.pw_name);
+	      freecon (user_context);
+	      return E_NOPERM;
+	    }
+	  else
+	    {
+	      fprintf (stderr,
+		       _("SELinux is in permissive mode, continuing\n"));
+	      freecon (user_context);
+	    }
+        }
+    }
 #endif
 
-	check_perms (pw);
 
-	/*
-	 * Now get the login shell. Either get it from the password
-	 * file, or use the value from the command line.
-	 */
-	if (!sflg) {
-		STRFCPY (loginsh, pw->pw_shell);
-	}
+  /* Only root is allowed to change shell for local users. */
+  if (uid && uid != pw_data->pw.pw_uid &&
+      (pw_data->service == S_LOCAL
+#ifdef USE_LDAP
+       || (pw_data->service == S_LDAP && binddn == NULL)
+#endif
+       ))
+    {
+      syslog (LOG_ERR, "%u cannot change shell for \"%s\"", uid,
+	      pw_data->pw.pw_name);
+      fprintf (stderr, _("You cannot change the shell for %s.\n"),
+	       caller_name);
+      free_user_t (pw_data);
+      return 1;
+    }
 
-	/*
-	 * If the login shell was not set on the command line, let the user
-	 * interactively change it.
-	 */
-	if (!sflg) {
-		printf (_("Changing the login shell for %s\n"), user);
-		new_fields ();
-	}
+  /* Normal user with restricted shell is not allowed to change it. */
+  if (uid && restricted_shell (pw_data->pw.pw_shell))
+    {
+      syslog (LOG_ERR, "User `%s' tries to change a restricted shell",
+	      pw_data->pw.pw_name);
+      fprintf(stderr, _("You cannot change a restricted shell.\n"));
+      free_user_t (pw_data);
+      return 1;
+    }
 
-	/*
-	 * Check all of the fields for valid information. The shell
-	 * field may not contain any illegal characters. Non-privileged
-	 * users are restricted to using the shells in /etc/shells.
-	 * The shell must be executable by the user.
-	 */
-	if (valid_field (loginsh, ":,=") != 0) {
-		fprintf (stderr, _("%s: Invalid entry: %s\n"), Prog, loginsh);
-		fail_exit (1);
-	}
-	if (   !amroot
-	    && (   is_restricted_shell (loginsh)
-	        || (access (loginsh, X_OK) != 0))) {
-		fprintf (stderr, _("%s: %s is an invalid shell.\n"), Prog, loginsh);
-		fail_exit (1);
-	}
+  if (!silent)
+    printf (_("Changing login shell for %s.\n"), locale_name);
 
-	update_shell (user, loginsh);
+  if (getlogindefs_bool ("CHFN_AUTH", 1) || pw_data->service != S_LOCAL)
+    {
+#ifdef USE_LDAP
+      if (binddn && pw_data->service == S_LDAP)
+        {
+          /* A user tries to change data stored in a LDAP database and
+             knows the Manager dn, now we need the password from him.  */
+          ldap_session_t *session = create_ldap_session (LDAP_PATH_CONF);
+          char *cp;
 
-	SYSLOG ((LOG_INFO, "changed user '%s' shell to '%s'", user, loginsh));
+          if (session == NULL)
+            return E_FAILURE;
 
-	nscd_flush_cache ("passwd");
+          cp = getpass (_("Enter LDAP Password:"));
 
-	closelog ();
-	exit (E_SUCCESS);
+          pw_data->binddn = strdup (binddn);
+
+          if (open_ldap_session (session) != 0)
+            return E_FAILURE;
+
+          if (ldap_authentication (session, NULL, binddn, cp) != 0)
+            return E_NOPERM;
+
+          close_ldap_session (session);
+
+          pw_data->oldclearpwd = strdup (cp);
+        }
+      else
+#endif /* USE_LDAP */
+	if (do_authentication (program, caller_name, pw_data) != 0)
+	  {
+	    free_user_t (pw_data);
+	    return 1;
+	  }
+      if (pw_data->service != S_LOCAL && get_old_clear_password (pw_data) != 0)
+	return 1;
+    }
+
+  if (new_shell == NULL)
+    {
+      /* Allow user to abort with Ctrl-C here.  */
+      signal (SIGINT, SIG_DFL);
+      printf (_("Enter the new value, or press return for the default.\n"));
+      new_shell = get_value (pw_data->pw.pw_shell, _("Login Shell"));
+      signal (SIGINT, SIG_IGN);
+    }
+
+  /* we don't need to change the shell if here is no change */
+  if (new_shell == NULL || strcmp (pw_data->pw.pw_shell, new_shell) == 0)
+    {
+      if (!silent)
+	printf (_("Shell not changed.\n"));
+      return 0;
+    }
+
+  pw_data->new_shell = new_shell;
+
+  if (check_shell (program, new_shell) != 0)
+    {
+      free_user_t (pw_data);
+      return 1;
+    }
+
+  if (write_user_data (pw_data, 0) != 0)
+    {
+      fprintf (stderr, _("Error while changing login shell.\n"));
+      free_user_t (pw_data);
+      return 1;
+    }
+  else
+    {
+#ifdef HAVE_NSCD_FLUSH_CACHE
+      nscd_flush_cache ("passwd");
+#endif
+      if (!silent)
+	printf (_("Shell changed.\n"));
+    }
+
+  free_user_t (pw_data);
+
+  return 0;
 }
-

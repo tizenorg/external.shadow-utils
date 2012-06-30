@@ -1,276 +1,500 @@
-/*
- * Copyright (c) 1996 - 2000, Marek Michałkiewicz
- * Copyright (c) 2002 - 2006, Tomasz Kłoczko
- * Copyright (c) 2009       , Nicolas François
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The name of the copyright holders or contributors may not be used to
- *    endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+/* Copyright (C) 2004, 2005, 2006, 2007, 2009 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@suse.de>
 
-/*
- * pwconv - create or update /etc/shadow with information from
- * /etc/passwd.
- *
- * It is more like SysV pwconv, slightly different from the original Shadow
- * pwconv. Depends on "x" as password in /etc/passwd which means that the
- * password has already been moved to /etc/shadow. There is no need to move
- * /etc/npasswd to /etc/passwd, password files are updated using library
- * routines with proper locking.
- *
- * Can be used to update /etc/shadow after adding/deleting users by editing
- * /etc/passwd. There is no man page yet, but this program should be close
- * to pwconv(1M) on Solaris 2.x.
- *
- * Warning: make sure that all users have "x" as the password in /etc/passwd
- * before running this program for the first time on a system which already
- * has shadow passwords. Anything else (like "*" from old versions of the
- * shadow suite) will replace the user's encrypted password in /etc/shadow.
- *
- * Doesn't currently support pw_age information in /etc/passwd, and doesn't
- * support DBM files. Add it if you need it...
- *
- */
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
 
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
+
+
+#ifdef HAVE_CONFIG_H
 #include <config.h>
+#endif
 
-#ident "$Id: pwconv.c 2851 2009-04-30 21:39:38Z nekral-guest $"
-
-#include <errno.h>
-#include <fcntl.h>
 #include <pwd.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <time.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
 #include <unistd.h>
-#include "defines.h"
-#include "getdef.h"
-#include "prototypes.h"
-#include "pwio.h"
-#include "shadowio.h"
-#include "nscd.h"
+#include <string.h>
+#include <getopt.h>
+#include <sys/stat.h>
+#ifdef HAVE_LIBNSCD_H
+#include <libnscd.h>
+#endif
 
-/*
- * exit status values
- */
-/*@-exitarg@*/
-#define E_SUCCESS	0	/* success */
-#define E_NOPERM	1	/* permission denied */
-#define E_USAGE		2	/* invalid command syntax */
-#define E_FAILURE	3	/* unexpected failure, nothing done */
-#define E_MISSING	4	/* unexpected failure, passwd file missing */
-#define E_PWDBUSY	5	/* passwd file(s) busy */
-#define E_BADENTRY	6	/* bad shadow entry */
-/*
- * Global variables
- */
-char *Prog;
+#include "i18n.h"
+#include "public.h"
+#include "logindefs.h"
+#include "read-files.h"
+#include "error_codes.h"
 
-static bool spw_locked = false;
-static bool pw_locked = false;
-
-/* local function prototypes */
-static void fail_exit (int status);
-
-static void fail_exit (int status)
+static void
+print_usage (FILE *stream, const char *program)
 {
-	if (pw_locked) {
-		if (pw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-			/* continue */
-		}
-	}
-
-	if (spw_locked) {
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-	}
-
-	exit (status);
+  fprintf (stream, _("Usage: %s\n"), program);
 }
 
-int main (int argc, char **argv)
+static void
+print_help (const char *program)
 {
-	const struct passwd *pw;
-	struct passwd pwent;
-	const struct spwd *sp;
-	struct spwd spent;
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - convert to shadow account\n\n"),
+	   program);
 
-	if (1 != argc) {
-		(void) fputs (_("Usage: pwconv\n"), stderr);
-	}
-	Prog = Basename (argv[0]);
-
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
-
-	OPENLOG ("pwconv");
-
-	if (pw_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, pw_dbname ());
-		fail_exit (E_PWDBUSY);
-	}
-	pw_locked = true;
-	if (pw_open (O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"), Prog, pw_dbname ());
-		fail_exit (E_MISSING);
-	}
-
-	if (spw_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, spw_dbname ());
-		fail_exit (E_PWDBUSY);
-	}
-	spw_locked = true;
-	if (spw_open (O_CREAT | O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"), Prog, spw_dbname ());
-		fail_exit (E_FAILURE);
-	}
-
-	/*
-	 * Remove /etc/shadow entries for users not in /etc/passwd.
-	 */
-	spw_rewind ();
-	while ((sp = spw_next ()) != NULL) {
-		if (pw_locate (sp->sp_namp) != NULL) {
-			continue;
-		}
-
-		if (spw_remove (sp->sp_namp) == 0) {
-			/*
-			 * This shouldn't happen (the entry exists) but...
-			 */
-			fprintf (stderr,
-			         _("%s: cannot remove entry '%s' from %s\n"),
-			         Prog, sp->sp_namp, spw_dbname ());
-			fail_exit (E_FAILURE);
-		}
-	}
-
-	/*
-	 * Update shadow entries which don't have "x" as pw_passwd. Add any
-	 * missing shadow entries.
-	 */
-	pw_rewind ();
-	while ((pw = pw_next ()) != NULL) {
-		sp = spw_locate (pw->pw_name);
-		if (NULL != sp) {
-			/* do we need to update this entry? */
-			if (strcmp (pw->pw_passwd, SHADOW_PASSWD_STRING) == 0) {
-				continue;
-			}
-			/* update existing shadow entry */
-			spent = *sp;
-		} else {
-			/* add new shadow entry */
-			memset (&spent, 0, sizeof spent);
-			spent.sp_namp   = pw->pw_name;
-			spent.sp_min    = getdef_num ("PASS_MIN_DAYS", -1);
-			spent.sp_max    = getdef_num ("PASS_MAX_DAYS", -1);
-			spent.sp_warn   = getdef_num ("PASS_WARN_AGE", -1);
-			spent.sp_inact  = -1;
-			spent.sp_expire = -1;
-			spent.sp_flag   = SHADOW_SP_FLAG_UNSET;
-		}
-		spent.sp_pwdp = pw->pw_passwd;
-		spent.sp_lstchg = (long) time ((time_t *) 0) / SCALE;
-		if (0 == spent.sp_lstchg) {
-			/* Better disable aging than requiring a password
-			 * change */
-			spent.sp_lstchg = -1;
-		}
-		if (spw_update (&spent) == 0) {
-			fprintf (stderr,
-			         _("%s: failed to prepare the new %s entry '%s'\n"),
-			         Prog, spw_dbname (), spent.sp_namp);
-			fail_exit (E_FAILURE);
-		}
-
-		/* remove password from /etc/passwd */
-		pwent = *pw;
-		pwent.pw_passwd = SHADOW_PASSWD_STRING;	/* XXX warning: const */
-		if (pw_update (&pwent) == 0) {
-			fprintf (stderr,
-			         _("%s: failed to prepare the new %s entry '%s'\n"),
-			         Prog, pw_dbname (), pwent.pw_name);
-			fail_exit (E_FAILURE);
-		}
-	}
-
-	if (spw_close () == 0) {
-		fprintf (stderr,
-		         _("%s: failure while writing changes to %s\n"),
-		         Prog, spw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", spw_dbname ()));
-		fail_exit (E_FAILURE);
-	}
-	if (pw_close () == 0) {
-		fprintf (stderr,
-		         _("%s: failure while writing changes to %s\n"),
-		         Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", pw_dbname ()));
-		fail_exit (E_FAILURE);
-	}
-
-	/* /etc/passwd- (backup file) */
-	if (chmod (PASSWD_FILE "-", 0600) != 0) {
-		fprintf (stderr,
-		         _("%s: failed to change the mode of %s to 0600\n"),
-		         Prog, PASSWD_FILE "-");
-		SYSLOG ((LOG_ERR, "failed to change the mode of %s to 0600", PASSWD_FILE "-"));
-		/* continue */
-	}
-
-	if (pw_locked) {
-		if (pw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-			/* continue */
-		}
-	}
-
-	if (spw_locked) {
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-	}
-
-	nscd_flush_cache ("passwd");
-
-	return E_SUCCESS;
+  fputs (_("  -P path        Search passwd and shadow file in \"path\"\n"),
+         stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
 }
 
+static struct passwd *
+files_getpwent (void)
+{
+  enum nss_status status;
+  static int buflen = 256;
+  static char *buffer = NULL;
+  static struct passwd resultbuf;
+
+  if (buffer == NULL)
+    buffer = malloc (buflen);
+
+  while ((status = files_getpwent_r (&resultbuf, buffer, buflen, &errno))
+         == NSS_STATUS_TRYAGAIN && errno == ERANGE)
+    {
+      errno = 0;
+      buflen += 256;
+      buffer = realloc (buffer, buflen);
+    }
+  if (status == NSS_STATUS_SUCCESS)
+    return &resultbuf;
+  else
+    return NULL;
+}
+
+static struct spwd *
+files_getspent (void)
+{
+  enum nss_status status;
+  static int buflen = 256;
+  static char *buffer = NULL;
+  static struct spwd resultbuf;
+
+  if (buffer == NULL)
+    buffer = malloc (buflen);
+
+  while ((status = files_getspent_r (&resultbuf, buffer, buflen, &errno))
+         == NSS_STATUS_TRYAGAIN && errno == ERANGE)
+    {
+      errno = 0;
+      buflen += 256;
+      buffer = realloc (buffer, buflen);
+    }
+  if (status == NSS_STATUS_SUCCESS)
+    return &resultbuf;
+  else
+    return NULL;
+}
+
+int
+main (int argc, char *argv[])
+{
+  struct passwd *pw;
+  struct spwd *sp;
+  char *program;
+  char *cp;
+  char *tmpshadow = NULL;
+  char *tmppasswd = NULL;
+
+
+#ifdef ENABLE_NLS
+  setlocale(LC_ALL, "");
+  bindtextdomain(PACKAGE, LOCALEDIR);
+  textdomain(PACKAGE);
+#endif
+
+  /* determine name of binary, which specifies edit mode.  */
+  program = ((cp = strrchr (*argv, '/')) ? cp + 1 : *argv);
+
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+      static struct option long_options[] = {
+	{"path",    required_argument, NULL, 'P'},
+        {"version", no_argument, NULL, 'v' },
+        {"usage",   no_argument, NULL, 'u' },
+        {"help",    no_argument, NULL, '\255' },
+        {NULL,      0,           NULL, '\0'}
+      };
+
+      c = getopt_long (argc, argv, "vuP:",
+                       long_options, &option_index);
+      if (c == (-1))
+        break;
+      switch (c)
+	{
+        case 'P':
+          files_etc_dir = strdup (optarg);
+	  break;
+	case '\255':
+          print_help (program);
+          return 0;
+        case 'v':
+          print_version (program, "2005");
+          return 0;
+        case 'u':
+          print_usage (stdout, program);
+	  return 0;
+	default:
+	  print_error (program);
+	  return E_USAGE;
+	}
+    }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc > 0)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+  else
+    {
+      /* Check, if /etc/shadow file exist. If not, create one.  */
+      char *path;
+      struct stat st;
+
+      if (asprintf (&path, "%s/shadow", files_etc_dir) < 0)
+        {
+          fputs ("running out of memory!\n", stderr);
+	  free (path);
+          return E_FAILURE;
+        }
+
+      if (lstat (path, &st) < 0)
+	{
+	  /* ENOENT means, the file does not exist and we have
+	     to create it. Else report an error and abort.  */
+	  if (errno == ENOENT)
+	    {
+	      int fd = creat (path, S_IRUSR|S_IWUSR);
+	      struct group *shadow_grp = getgrnam ("shadow");
+
+	      if (fd < 0)
+		{
+		  fprintf (stderr, _("Can't create `%s': %m\n"), path);
+		  free (path);
+		  return E_FAILURE;
+		}
+
+	      if (chown (path, 0, shadow_grp ? shadow_grp->gr_gid : 0) < 0)
+		{
+		  fprintf (stderr,
+			   _("Cannot change owner/group for `%s': %s\n"),
+			   path, strerror (errno));
+		  unlink (path);
+		  free (path);
+		  return E_FAILURE;
+		}
+	      if (chmod (path, S_IRUSR|S_IWUSR|S_IRGRP) < 0)
+		{
+		  fprintf (stderr,
+			   _("Cannot change permissions for `%s': %s\n"),
+			   path, strerror (errno));
+		  unlink (path);
+		  free (path);
+		  return E_FAILURE;
+		}
+	    }
+	  else
+	    {
+	      fprintf (stderr, _("Can't stat `%s': %m\n"), path);
+	      free (path);
+	      return E_FAILURE;
+	    }
+	}
+      else
+	{
+	  /* else file exist, create a backup copy.  */
+	  if (asprintf (&tmpshadow, "%s/shadow.pwconv", files_etc_dir) < 0)
+	    {
+	      fputs ("running out of memory!\n", stderr);
+	      free (tmpshadow);
+	      free (path);
+	      return E_FAILURE;
+	    }
+	  /* remove old stale files */
+	  unlink (tmpshadow);
+	  if (link (path, tmpshadow) < 0)
+	    {
+	      fprintf (stderr, _("Cannot create backup file `%s': %m\n"),
+		       tmpshadow);
+	      free (tmpshadow);
+	      free (path);
+	      return E_FAILURE;
+	    }
+	}
+      free (path);
+
+      /* Now create a copy of the original passwd file.  */
+      if (asprintf (&path, "%s/passwd", files_etc_dir) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  unlink (tmpshadow);
+	  return E_FAILURE;
+	}
+      if (asprintf (&tmppasswd, "%s/passwd.pwconv", files_etc_dir) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  unlink (tmpshadow);
+	  return E_FAILURE;
+	}
+      if (link (path, tmppasswd) < 0)
+	{
+	  fprintf (stderr, _("Cannot create backup file `%s': %m\n"),
+		   tmppasswd);
+	  unlink (tmpshadow);
+	  if (tmpshadow)
+	    free (tmpshadow);
+	  free (tmppasswd);
+	  return E_FAILURE;
+	}
+      free (path);
+    }
+
+
+  /* Remove accounts from /etc/shadow, which have no entry in
+     /etc/passwd.  */
+  while ((sp = files_getspent ()) != NULL)
+    {
+      user_t *pw_data;
+
+      if (sp->sp_namp[0] == '-' || sp->sp_namp[0] == '+')
+	{
+	  if (sp->sp_namp[1] == '@' || sp->sp_namp[1] == '\0')
+	    continue; /* we cannot check netgroups */
+	  else
+	    pw_data = do_getpwnam (&sp->sp_namp[1], NULL);
+	}
+      else
+	pw_data = do_getpwnam (sp->sp_namp, NULL);
+
+      if (pw_data == NULL || pw_data->service == S_NONE)
+	{
+	  user_t *sp_data = calloc (1, sizeof (user_t));
+
+	  if (sp_data == NULL)
+	    {
+	      fputs ("running out of memory!\n", stderr);
+	      unlink (tmpshadow);
+	      unlink (tmppasswd);
+	      return E_FAILURE;
+	    }
+	  fprintf (stdout,
+		   _("Orphaned entry '%s' removed from shadow database.\n"),
+		   sp->sp_namp);
+	  sp_data->service = S_LOCAL;
+	  sp_data->todo = DO_DELETE_SHADOW;
+	  sp_data->use_shadow = 1;
+	  sp_data->pw.pw_name = sp->sp_namp;
+	  if (write_user_data (sp_data, 0) != 0)
+	    {
+	      fprintf (stderr,
+		       _("Error while deleting `%s' shadow account.\n"),
+		       sp_data->pw.pw_name);
+	      free (sp_data);
+	      unlink (tmpshadow);
+	      unlink (tmppasswd);
+	      return E_FAILURE;
+	    }
+	  free (sp_data);
+	}
+      free_user_t (pw_data);
+    }
+
+  /* For all accounts in /etc/passwd: If the passwd entry contains
+     a password and a shadow entry exist, update the shadow entry.
+     If no shadow entry exist, create one.  */
+
+  while ((pw = files_getpwent ()) != NULL)
+    {
+      user_t *pw_data = do_getpwnam (pw->pw_name, "files");
+
+      if (pw_data == NULL || pw_data->service == S_NONE)
+        {
+	  /* Ignore NIS entries */
+	  if (pw->pw_name[0] == '-' || pw->pw_name[0] == '+')
+	    continue;
+
+	  fprintf (stderr,
+		   _("%s: Error trying to get data for `%s'\n"),
+		   program, pw->pw_name);
+	  unlink (tmpshadow);
+	  unlink (tmppasswd);
+	  return E_FAILURE;
+	}
+
+      /* This user does not have a shadow entry. Create one.  */
+      if (!pw_data->use_shadow)
+	{
+	  int rc;
+
+	  /* Backup original password and replace it with a "x"
+	     in local files. Report error*/
+	  pw_data->todo = DO_MODIFY;
+	  pw_data->sp.sp_pwdp = pw_data->pw.pw_passwd;
+	  pw_data->newpassword = strdup ("x");
+	  rc = write_user_data (pw_data, 0);
+
+	  if (rc != 0)
+	    {
+	      fprintf (stderr,
+		       _("Error while converting `%s' to shadow account.\n"),
+		       pw_data->pw.pw_name);
+	      free_user_t (pw_data);
+	      unlink (tmpshadow);
+	      unlink (tmppasswd);
+	      return E_FAILURE;
+	    }
+
+	  pw_data->use_shadow = 1;
+	  pw_data->todo = DO_CREATE_SHADOW;
+	  free (pw_data->newpassword);
+	  pw_data->newpassword = strdup (pw_data->pw.pw_passwd);
+	  pw_data->sp.sp_namp = pw_data->pw.pw_name;
+	  pw_data->sp.sp_lstchg = time ((time_t *) 0) / (24L * 3600L);
+	  pw_data->sp.sp_min = getlogindefs_num ("PASS_MIN_DAYS", -1);
+	  pw_data->sp.sp_max = getlogindefs_num ("PASS_MAX_DAYS", -1);
+	  pw_data->sp.sp_warn = getlogindefs_num ("PASS_WARN_AGE", -1);
+	  pw_data->sp.sp_inact = -1;
+	  pw_data->sp.sp_expire = -1;
+
+	  if (write_user_data (pw_data, 0) != 0)
+	    {
+	      fprintf (stderr,
+		       _("Error while converting `%s' to shadow account.\n"),
+		       pw_data->pw.pw_name);
+	      free_user_t (pw_data);
+	      unlink (tmpshadow);
+	      unlink (tmppasswd);
+	      return E_FAILURE;
+	    }
+#ifdef HAVE_NSCD_FLUSH_CACHE
+	  else
+	    nscd_flush_cache ("passwd");
+#endif
+	}
+      else if (strcmp (pw_data->pw.pw_passwd, "x") != 0)
+	{
+	  /* The user has a shadow account and an entry in
+	     /etc/passwd.  */
+
+	  /* Backup original password and replace it with a "x"
+	     in local passwd file. Report error*/
+	  int rc;
+	  char *oldpassword = pw_data->pw.pw_passwd;
+
+	  pw_data->todo = DO_MODIFY;
+	  pw_data->newpassword = strdup ("x");
+	  pw_data->use_shadow = 0;
+	  rc = write_user_data (pw_data, 0);
+	  pw_data->use_shadow = 1;
+
+	  if (rc != 0)
+	    {
+	      fprintf (stderr,
+		       _("Error while converting `%s' to shadow account.\n"),
+		       pw_data->pw.pw_name);
+	      free_user_t (pw_data);
+	      unlink (tmpshadow);
+	      unlink (tmppasswd);
+	      return E_FAILURE;
+	    }
+
+	  pw_data->spn = pw_data->sp;
+	  pw_data->spn.sp_lstchg = time ((time_t *) 0) / (24L * 3600L);
+	  pw_data->sp_changed = 1;
+	  free (pw_data->newpassword);
+	  pw_data->newpassword = strdup (oldpassword);
+	  if (write_user_data (pw_data, 0) != 0)
+	    {
+	      fprintf (stderr,
+		       _("Error while converting `%s' to shadow account.\n"),
+		       pw_data->pw.pw_name);
+	      free_user_t (pw_data);
+	      unlink (tmpshadow);
+	      unlink (tmppasswd);
+	      return E_FAILURE;
+	    }
+#ifdef HAVE_NSCD_FLUSH_CACHE
+	  else
+	    nscd_flush_cache ("passwd");
+#endif
+	}
+
+      free_user_t (pw_data);
+    }
+
+  /* Rename our own copy to shadow.old. As result, /etc/shadow.old
+     will have the contents of /etc/shadow when starting this program.  */
+  if (tmpshadow)
+    {
+      char *oldshadow;
+
+      if (asprintf (&oldshadow, "%s/shadow.old", files_etc_dir) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  return E_FAILURE;
+	}
+      unlink (oldshadow);
+      if (rename (tmpshadow, oldshadow) < 0)
+	{
+	  fprintf (stderr,
+		   _("Error while renaming temporary shadow file: %m\n"));
+	  unlink (tmpshadow);
+	  unlink (tmppasswd);
+	  return E_FAILURE;
+	}
+      free (oldshadow);
+      free (tmpshadow);
+    }
+
+  /* Rename our own copy to passwd.old. As result, /etc/passwd.old
+     will have the contents of /etc/passwd when starting this program.  */
+  if (tmppasswd)
+    {
+      char *oldpasswd;
+
+      if (asprintf (&oldpasswd, "%s/passwd.old", files_etc_dir) < 0)
+	{
+	  fputs ("running out of memory!\n", stderr);
+	  unlink (tmppasswd);
+	  return E_FAILURE;
+	}
+      unlink (oldpasswd);
+      if (rename (tmppasswd, oldpasswd) < 0)
+	{
+	  fprintf (stderr,
+		   _("Error while renaming temporary password file: %m\n"));
+	  unlink (tmppasswd);
+	  return E_FAILURE;
+	}
+      free (oldpasswd);
+      free (tmppasswd);
+    }
+
+  return E_SUCCESS;
+}

@@ -1,1001 +1,667 @@
-/*
- * Copyright (c) 1991 - 1994, Julianne Frances Haugh
- * Copyright (c) 1996 - 2000, Marek Michałkiewicz
- * Copyright (c) 2000 - 2006, Tomasz Kłoczko
- * Copyright (c) 2007 - 2008, Nicolas François
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. The name of the copyright holders or contributors may not be used to
- *    endorse or promote products derived from this software without
- *    specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
- * HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+/* Copyright (C) 2003, 2004, 2005, 2009, 2010 Thorsten Kukuk
+   Author: Thorsten Kukuk <kukuk@suse.de>
 
-#include <config.h>
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation.
 
-#ident "$Id: userdel.c 2979 2009-05-22 10:41:10Z nekral-guest $"
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
 
-#include <errno.h>
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software Foundation,
+   Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.  */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include <time.h>
+#include <utmp.h>
 #include <fcntl.h>
+#include <paths.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
 #include <getopt.h>
-#include <grp.h>
-#include <pwd.h>
-#include <stdio.h>
-#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <libgen.h>
 #include <sys/stat.h>
-#include <sys/stat.h>
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-#include "pam_defs.h"
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
-#include "defines.h"
-#include "getdef.h"
-#include "groupio.h"
-#include "nscd.h"
-#include "prototypes.h"
-#include "pwauth.h"
-#include "pwio.h"
-#include "shadowio.h"
-#ifdef	SHADOWGRP
-#include "sgroupio.h"
+#include <sys/resource.h>
+#ifdef HAVE_LIBNSCD_H
+#include <libnscd.h>
 #endif
-/*@-exitarg@*/
-#include "exitcodes.h"
 
-/*
- * exit status values
- */
-#define E_PW_UPDATE	1	/* can't update password file */
-#define E_NOTFOUND	6	/* specified user doesn't exist */
-#define E_USER_BUSY	8	/* user currently logged in */
-#define E_GRP_UPDATE	10	/* can't update group file */
-#define E_HOMEDIR	12	/* can't remove home directory */
-
-/*
- * Global variables
- */
-char *Prog;
-
-static char *user_name;
-static uid_t user_id;
-static char *user_home;
-
-static bool fflg = false;
-static bool rflg = false;
-
-static bool is_shadow_pwd;
-
-#ifdef SHADOWGRP
-static bool is_shadow_grp;
-static bool sgr_locked = false;
+#ifdef USE_LDAP
+#include "libldap.h"
 #endif
-static bool pw_locked  = false;
-static bool gr_locked   = false;
-static bool spw_locked  = false;
 
-/* local function prototypes */
-static void usage (void);
-static void update_groups (void);
-static void close_files (void);
-static void fail_exit (int);
-static void open_files (void);
-static void update_user (void);
-static void user_cancel (const char *);
+#include "i18n.h"
+#include "public.h"
+#include "group.h"
+#include "logging.h"
+#include "logindefs.h"
+#include "read-files.h"
+#include "error_codes.h"
 
-#ifdef EXTRA_CHECK_HOME_DIR
-static bool path_prefix (const char *, const char *);
-#endif
-static int is_owner (uid_t, const char *);
-static int remove_mailbox (void);
-
-/*
- * usage - display usage message and exit
- */
-static void usage (void)
+static void
+print_usage (FILE *stream, const char *program)
 {
-	fputs (_("Usage: userdel [options] LOGIN\n"
-	         "\n"
-	         "Options:\n"
-	         "  -f, --force                   force removal of files,\n"
-	         "                                even if not owned by user\n"
-	         "  -h, --help                    display this help message and exit\n"
-	         "  -r, --remove                  remove home directory and mail spool\n"
-	         "\n"), stderr);
-	exit (E_USAGE);
+  fprintf (stream, _("Usage: %s [-D binddn] [-P path] [-r [-f]] user\n"), program);
 }
 
-/*
- * update_groups - delete user from secondary group set
- *
- *	update_groups() takes the user name that was given and searches
- *	the group files for membership in any group.
- *
- *	we also check to see if they have any groups they own (the same
- *	name is their user name) and delete them too (only if USERGROUPS_ENAB
- *	is enabled).
- */
-static void update_groups (void)
+static void
+print_help (const char *program)
 {
-	const struct group *grp;
-	struct group *ngrp;
-	struct passwd *pwd;
+  print_usage (stdout, program);
+  fprintf (stdout, _("%s - delete a user and related files\n\n"), program);
 
-#ifdef	SHADOWGRP
-	bool deleted_user_group = false;
-	const struct sgrp *sgrp;
-	struct sgrp *nsgrp;
-#endif				/* SHADOWGRP */
-
-	/*
-	 * Scan through the entire group file looking for the groups that
-	 * the user is a member of.
-	 */
-	for (gr_rewind (), grp = gr_next (); NULL != grp; grp = gr_next ()) {
-
-		/*
-		 * See if the user specified this group as one of their
-		 * concurrent groups.
-		 */
-		if (!is_on_list (grp->gr_mem, user_name)) {
-			continue;
-		}
-
-		/* 
-		 * Delete the username from the list of group members and
-		 * update the group entry to reflect the change.
-		 */
-		ngrp = __gr_dup (grp);
-		if (NULL == ngrp) {
-			fprintf (stderr,
-			         _("%s: Out of memory. Cannot update %s.\n"),
-			         Prog, gr_dbname ());
-			exit (13);	/* XXX */
-		}
-		ngrp->gr_mem = del_list (ngrp->gr_mem, user_name);
-		if (gr_update (ngrp) == 0) {
-			fprintf (stderr,
-			         _("%s: failed to prepare the new %s entry '%s'\n"),
-			         Prog, gr_dbname (), ngrp->gr_name);
-			exit (E_GRP_UPDATE);
-		}
-
-		/*
-		 * Update the DBM group file with the new entry as well.
-		 */
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "deleting user from group",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_SUCCESS);
+  fputs (_("  -r             Remove home directory and mail spool\n"),
+	 stdout);
+  fputs (_("  -f             Force removal of files, even if not owned by user\n"),
+	 stdout);
+#ifdef USE_LDAP
+  fputs (_("  -D binddn      Use dn \"binddn\" to bind to the LDAP directory\n"),
+         stdout);
 #endif
-		SYSLOG ((LOG_INFO, "delete '%s' from group '%s'\n",
-			 user_name, ngrp->gr_name));
-	}
-
-	/*
-	 * we've removed their name from all the groups above, so
-	 * now if they have a group with the same name as their
-	 * user name, with no members, we delete it.
-	 * FIXME: below, the check for grp->gr_mem[0] is not sufficient.
-	 *        We should retrieve the group with gr_locate and check
-	 *        that gr_mem is empty.
-	 */
-	grp = xgetgrnam (user_name);
-	if (   (NULL != grp)
-	    && getdef_bool ("USERGROUPS_ENAB")
-	    && (   (NULL == grp->gr_mem[0])
-	        || (   (NULL == grp->gr_mem[1])
-	            && (strcmp (grp->gr_mem[0], user_name) == 0)))) {
-
-		pwd = NULL;
-		if (!fflg) {
-			/*
-			 * Scan the passwd file to check if this group is still
-			 * used as a primary group.
-			 */
-			setpwent ();
-			while ((pwd = getpwent ()) != NULL) {
-				if (strcmp (pwd->pw_name, user_name) == 0) {
-					continue;
-				}
-				if (pwd->pw_gid == grp->gr_gid) {
-					fprintf (stderr,
-					         _("%s: group %s is the primary group of another user and is not removed.\n"),
-					         Prog, grp->gr_name);
-					break;
-				}
-			}
-			endpwent ();
-		}
-
-		if (NULL == pwd) {
-			/*
-			 * We can remove this group, it is not the primary
-			 * group of any remaining user.
-			 */
-			if (gr_remove (grp->gr_name) == 0) {
-				fprintf (stderr,
-				         _("%s: cannot remove entry '%s' from %s\n"),
-				         Prog, grp->gr_name, gr_dbname ());
-				fail_exit (E_GRP_UPDATE);
-			}
-
-#ifdef SHADOWGRP
-			deleted_user_group = true;
-#endif
-
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_GROUP, Prog,
-			              "deleting group",
-			              grp->gr_name, AUDIT_NO_ID,
-			              SHADOW_AUDIT_SUCCESS);
-#endif
-			SYSLOG ((LOG_INFO,
-				 "removed group '%s' owned by '%s'\n",
-				 grp->gr_name, user_name));
-		}
-	}
-#ifdef	SHADOWGRP
-	if (!is_shadow_grp) {
-		return;
-	}
-
-	/*
-	 * Scan through the entire shadow group file looking for the groups
-	 * that the user is a member of. Both the administrative list and
-	 * the ordinary membership list is checked.
-	 */
-	for (sgr_rewind (), sgrp = sgr_next ();
-	     NULL != sgrp;
-	     sgrp = sgr_next ()) {
-		bool was_member, was_admin;
-
-		/*
-		 * See if the user specified this group as one of their
-		 * concurrent groups.
-		 */
-		was_member = is_on_list (sgrp->sg_mem, user_name);
-		was_admin = is_on_list (sgrp->sg_adm, user_name);
-
-		if (!was_member && !was_admin) {
-			continue;
-		}
-
-		nsgrp = __sgr_dup (sgrp);
-		if (NULL == nsgrp) {
-			fprintf (stderr,
-			         _("%s: Out of memory. Cannot update %s.\n"),
-			         Prog, sgr_dbname ());
-			exit (13);	/* XXX */
-		}
-
-		if (was_member) {
-			nsgrp->sg_mem = del_list (nsgrp->sg_mem, user_name);
-		}
-
-		if (was_admin) {
-			nsgrp->sg_adm = del_list (nsgrp->sg_adm, user_name);
-		}
-
-		if (sgr_update (nsgrp) == 0) {
-			fprintf (stderr,
-			         _("%s: failed to prepare the new %s entry '%s'\n"),
-			         Prog, sgr_dbname (), nsgrp->sg_name);
-			exit (E_GRP_UPDATE);
-		}
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "deleting user from shadow group",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_SUCCESS);
-#endif
-		SYSLOG ((LOG_INFO, "delete '%s' from shadow group '%s'\n",
-			 user_name, nsgrp->sg_name));
-	}
-
-	if (   deleted_user_group
-	    && (sgr_locate (user_name) != NULL)) {
-		if (sgr_remove (user_name) == 0) {
-			fprintf (stderr,
-			         _("%s: cannot remove entry '%s' from %s\n"),
-			         Prog, user_name, sgr_dbname ());
-			fail_exit (E_GRP_UPDATE);
-		}
-	}
-#endif				/* SHADOWGRP */
+  fputs (_("  -P path        Search passwd, shadow and group file in \"path\"\n"),
+	 stdout);
+  fputs (_(" --service srv   Add account to nameservice 'srv'\n"), stdout);
+  fputs (_("      --help     Give this help list\n"), stdout);
+  fputs (_("  -u, --usage    Give a short usage message\n"), stdout);
+  fputs (_("  -v, --version  Print program version\n"), stdout);
+  fputs (_("Valid services for --service are: files, ldap\n"), stdout);
 }
 
-/*
- * close_files - close all of the files that were opened
- *
- *	close_files() closes all of the files that were opened for this
- *	new user. This causes any modified entries to be written out.
- */
-static void close_files (void)
-{
-	if (pw_close () == 0) {
-		fprintf (stderr, _("%s: failure while writing changes to %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", pw_dbname ()));
-		fail_exit (E_PW_UPDATE);
-	}
-	if (pw_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-		/* continue */
-	}
-	pw_locked = false;
+static const char *program = "userdel";
 
-	if (is_shadow_pwd) {
-		if (spw_close () == 0) {
-			fprintf (stderr,
-			         _("%s: failure while writing changes to %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failure while writing changes to %s", spw_dbname ()));
-			fail_exit (E_PW_UPDATE);
-		}
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-		spw_locked = false;
-	}
-
-	if (gr_close () == 0) {
-		fprintf (stderr, _("%s: failure while writing changes to %s\n"), Prog, gr_dbname ());
-		SYSLOG ((LOG_ERR, "failure while writing changes to %s", gr_dbname ()));
-		fail_exit (E_GRP_UPDATE);
-	}
-	if (gr_unlock () == 0) {
-		fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, gr_dbname ());
-		SYSLOG ((LOG_ERR, "failed to unlock %s", gr_dbname ()));
-		/* continue */
-	}
-	gr_locked = false;
-
-#ifdef	SHADOWGRP
-	if (is_shadow_grp) {
-		if (sgr_close () == 0) {
-			fprintf (stderr,
-			         _("%s: failure while writing changes to %s\n"), Prog, sgr_dbname ());
-			SYSLOG ((LOG_ERR, "failure while writing changes to %s", sgr_dbname ()));
-			fail_exit (E_GRP_UPDATE);
-		}
-
-		if (sgr_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, sgr_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", sgr_dbname ()));
-			/* continue */
-		}
-		sgr_locked = false;
-	}
+static struct option long_options[] = {
+#ifdef USE_LDAP
+  {"binddn",      required_argument, NULL, 'D' },
 #endif
+  {"force",       no_argument,       NULL, 'f'},
+  {"remove-home", no_argument,       NULL, 'r'},
+  {"path",        required_argument, NULL, 'P'},
+  {"version",     no_argument,       NULL, 'v'},
+  {"service",     required_argument, NULL, '\253'},
+  {"usage",       no_argument,       NULL, 'u'},
+  {"help",        no_argument,       NULL, '\255'},
+  {NULL, 0, NULL, '\0'}
+};
+static const char *short_options = "D:frP:uv";
+
+static int
+is_owned_by (const char *path, uid_t uid)
+{
+  struct stat st;
+  if (lstat (path, &st) != 0)
+    return -1;
+  return (st.st_uid == uid);
 }
 
-/*
- * fail_exit - exit with a failure code after unlocking the files
- */
-static void fail_exit (int code)
+static struct passwd *
+files_getpwent (void)
 {
-	if (pw_locked) {
-		if (pw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, pw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", pw_dbname ()));
-			/* continue */
-		}
-	}
-	if (gr_locked) {
-		if (gr_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, gr_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", gr_dbname ()));
-			/* continue */
-		}
-	}
-	if (spw_locked) {
-		if (spw_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, spw_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", spw_dbname ()));
-			/* continue */
-		}
-	}
-#ifdef	SHADOWGRP
-	if (sgr_locked) {
-		if (sgr_unlock () == 0) {
-			fprintf (stderr, _("%s: failed to unlock %s\n"), Prog, sgr_dbname ());
-			SYSLOG ((LOG_ERR, "failed to unlock %s", sgr_dbname ()));
-			/* continue */
-		}
-	}
-#endif
+  enum nss_status status;
+  static int buflen = 256;
+  static char *buffer = NULL;
+  static struct passwd resultbuf;
 
-#ifdef WITH_AUDIT
-	audit_logger (AUDIT_DEL_USER, Prog,
-	              "deleting user",
-	              user_name, (unsigned int) user_id,
-	              SHADOW_AUDIT_FAILURE);
-#endif
+  if (buffer == NULL)
+    buffer = malloc (buflen);
 
-	exit (code);
+  while ((status = files_getpwent_r (&resultbuf, buffer, buflen, &errno))
+	 == NSS_STATUS_TRYAGAIN && errno == ERANGE)
+    {
+      errno = 0;
+      buflen += 256;
+      buffer = realloc (buffer, buflen);
+    }
+  if (status == NSS_STATUS_SUCCESS)
+    return &resultbuf;
+  else
+    return NULL;
 }
 
-/*
- * open_files - lock and open the password files
- *
- *	open_files() opens the two password files.
- */
-
-static void open_files (void)
+static struct group *
+files_getgrent (void)
 {
-	if (pw_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, pw_dbname ());
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "locking password file",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_FAILURE);
-#endif
-		fail_exit (E_PW_UPDATE);
-	}
-	pw_locked = true;
-	if (pw_open (O_RDWR) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot open %s\n"), Prog, pw_dbname ());
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "opening password file",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_FAILURE);
-#endif
-		fail_exit (E_PW_UPDATE);
-	}
-	if (is_shadow_pwd) {
-		if (spw_lock () == 0) {
-			fprintf (stderr,
-			         _("%s: cannot lock %s; try again later.\n"),
-			         Prog, spw_dbname ());
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "locking shadow password file",
-			              user_name, (unsigned int) user_id,
-			              SHADOW_AUDIT_FAILURE);
-#endif
-			fail_exit (E_PW_UPDATE);
-		}
-		spw_locked = true;
-		if (spw_open (O_RDWR) == 0) {
-			fprintf (stderr,
-			         _("%s: cannot open %s\n"),
-			         Prog, spw_dbname ());
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "opening shadow password file",
-			              user_name, (unsigned int) user_id,
-			              SHADOW_AUDIT_FAILURE);
-#endif
-			fail_exit (E_PW_UPDATE);
-		}
-	}
-	if (gr_lock () == 0) {
-		fprintf (stderr,
-		         _("%s: cannot lock %s; try again later.\n"),
-		         Prog, gr_dbname ());
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "locking group file",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_FAILURE);
-#endif
-		fail_exit (E_GRP_UPDATE);
-	}
-	gr_locked = true;
-	if (gr_open (O_RDWR) == 0) {
-		fprintf (stderr, _("%s: cannot open %s\n"), Prog, gr_dbname ());
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "opening group file",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_FAILURE);
-#endif
-		fail_exit (E_GRP_UPDATE);
-	}
-#ifdef	SHADOWGRP
-	if (is_shadow_grp) {
-		if (sgr_lock () == 0) {
-			fprintf (stderr,
-			         _("%s: cannot lock %s; try again later.\n"),
-			         Prog, sgr_dbname ());
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "locking shadow group file",
-			              user_name, (unsigned int) user_id,
-			              SHADOW_AUDIT_FAILURE);
-#endif
-			fail_exit (E_GRP_UPDATE);
-		}
-		sgr_locked= true;
-		if (sgr_open (O_RDWR) == 0) {
-			fprintf (stderr, _("%s: cannot open %s\n"),
-			         Prog, sgr_dbname ());
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "opening shadow group file",
-			              user_name, (unsigned int) user_id,
-			              SHADOW_AUDIT_FAILURE);
-#endif
-			fail_exit (E_GRP_UPDATE);
-		}
-	}
-#endif
+  enum nss_status status;
+  static int buflen = 256;
+  static char *buffer = NULL;
+  static struct group resultbuf;
+
+  if (buffer == NULL)
+    buffer = malloc (buflen);
+
+  while ((status = files_getgrent_r (&resultbuf, buffer, buflen, &errno))
+	 == NSS_STATUS_TRYAGAIN && errno == ERANGE)
+    {
+      errno = 0;
+      buflen += 256;
+      buffer = realloc (buffer, buflen);
+    }
+  if (status == NSS_STATUS_SUCCESS)
+    return &resultbuf;
+  else
+    return NULL;
 }
 
-/*
- * update_user - delete the user entries
- *
- *	update_user() deletes the password file entries for this user
- *	and will update the group entries as required.
- */
-static void update_user (void)
+static int
+in_use_by_other_users (const char *dir, const char *user,
+		       int have_extrapath)
 {
-	if (pw_remove (user_name) == 0) {
-		fprintf (stderr,
-		         _("%s: cannot remove entry '%s' from %s\n"),
-		         Prog, user_name, pw_dbname ());
-		fail_exit (E_PW_UPDATE);
+  struct passwd *pw;
+  size_t dirlen = strlen (dir);
+  int retval = 0;
+
+  setpwent ();
+
+  while ((pw = getpwent ()))
+    {
+      /* don't count ourself.  */
+      if (strcmp (pw->pw_name, user) == 0)
+	continue;
+      /* Another user can have the same directory or a subdirectory
+	 of our own directory as home directory.  */
+      if ((dirlen < strlen (pw->pw_dir) && strncmp (dir, pw->pw_dir, dirlen) == 0
+	   && pw->pw_dir[dirlen] == '/') || strcmp (dir, pw->pw_dir) == 0)
+	{
+	  fprintf (stderr,
+		   _("%s: directory `%s' is in use by `%s'.\n"),
+		   program, dir, pw->pw_name);
+	  retval = 1;
 	}
-	if (   is_shadow_pwd
-	    && (spw_locate (user_name) != NULL)
-	    && (spw_remove (user_name) == 0)) {
-		fprintf (stderr,
-		         _("%s: cannot remove entry '%s' from %s\n"),
-		         Prog, user_name, spw_dbname ());
-		fail_exit (E_PW_UPDATE);
-	}
-#ifdef WITH_AUDIT
-	audit_logger (AUDIT_DEL_USER, Prog,
-	              "deleting user entries",
-	              user_name, (unsigned int) user_id,
-	              SHADOW_AUDIT_SUCCESS);
-#endif
-	SYSLOG ((LOG_INFO, "delete user '%s'\n", user_name));
+    }
+
+  endpwent ();
+
+  if (have_extrapath)
+    while ((pw = files_getpwent ()))
+      {
+	/* don't count ourself.  */
+	if (strcmp (pw->pw_name, user) == 0)
+	  continue;
+	/* Another user can have the same directory or a subdirectory
+	   of our own directory as home directory.  */
+	if (strncmp (dir, pw->pw_dir, dirlen) == 0)
+	  {
+	    fprintf (stderr,
+		     _("%s: directory `%s' is in use by `%s'.\n"),
+		     program, dir, pw->pw_name);
+	    retval = 1;
+	  }
+      }
+
+  return retval;
 }
 
-/* 
- * user_cancel - cancel cron and at jobs
- *
- *	user_cancel calls a script for additional cleanups like removal of
- *	cron, at, or print jobs.
- */
-
-static void user_cancel (const char *user)
+static int
+remove_from_secondary_groups (user_t *pw_data, int have_extrapath)
 {
-	char *cmd;
-	pid_t pid, wpid;
-	int status;
+  struct item_t {
+    char *value;
+    struct item_t *next;
+  } *list = NULL, *item;
+  struct group *gr;
+  int retval = E_SUCCESS;
 
-	cmd = getdef_str ("USERDEL_CMD");
-	if (NULL == cmd) {
-		return;
-	}
-	pid = fork ();
-	if (pid == 0) {
-		execl (cmd, cmd, user, (char *) 0);
-		perror (cmd);
-		exit (errno == ENOENT ? E_CMD_NOTFOUND : E_CMD_NOEXEC);
-	} else if ((pid_t)-1 == pid) {
-		perror ("fork");
-		return;
-	}
-	do {
-		wpid = wait (&status);
-	} while ((wpid != pid) && ((pid_t)-1 != wpid));
-}
+  if (have_extrapath)
+    {
+      while ((gr = files_getgrent ()))
+	{
+	  unsigned int i;
 
-#ifdef EXTRA_CHECK_HOME_DIR
-static bool path_prefix (const char *s1, const char *s2)
-{
-	return (   (strncmp (s2, s1, strlen (s1)) == 0)
-	        && (   ('\0' == s2[strlen (s1)])
-	            || ('/'  == s2[strlen (s1)])));
-}
-#endif
-
-/*
- * is_owner - Check if path is owned by uid
- *
- * Return
- *  1: path exists and is owned by uid
- *  0: path is not owned by uid, or a failure occured
- * -1: path does not exist
- */
-static int is_owner (uid_t uid, const char *path)
-{
-	struct stat st;
-
-	errno = 0;
-	if (stat (path, &st) != 0) {
-		if ((ENOENT == errno) || (ENOTDIR == errno)) {
-			/* The file or directory does not exist */
-			return -1;
-		} else {
-			return 0;
-		}
-	}
-	return (st.st_uid == uid);
-}
-
-static int remove_mailbox (void)
-{
-	const char *maildir;
-	char mailfile[1024];
-	int i;
-	int errors = 0;
-
-	maildir = getdef_str ("MAIL_DIR");
-#ifdef MAIL_SPOOL_DIR
-	if ((NULL == maildir) && (getdef_str ("MAIL_FILE") == NULL)) {
-		maildir = MAIL_SPOOL_DIR;
-	}
-#endif
-	if (NULL == maildir) {
-		return 0;
-	}
-	snprintf (mailfile, sizeof mailfile, "%s/%s", maildir, user_name);
-	if (fflg) {
-		if (unlink (mailfile) != 0) {
-			fprintf (stderr,
-			         _("%s: warning: can't remove %s: %s\n"),
-			         Prog, mailfile, strerror (errno));
-			SYSLOG ((LOG_ERR, "Cannot remove %s: %s", mailfile, strerror (errno)));
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "deleting mail file",
-			              user_name, (unsigned int) user_id,
-			              SHADOW_AUDIT_FAILURE);
-#endif
-			errors = 1;
-			/* continue */
-		}
-#ifdef WITH_AUDIT
-		else
+	  for (i = 0; gr->gr_mem[i]; i++)
+	    {
+	      if (strcmp (gr->gr_mem[i], pw_data->pw.pw_name) == 0)
 		{
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "deleting mail file",
-			              user_name, (unsigned int) user_id,
-			              SHADOW_AUDIT_SUCCESS);
+		  item = malloc (sizeof (*item));
+		  item->value = strdup (gr->gr_name);
+		  item->next = list;
+		  list = item;
 		}
-#endif
-		return errors;
+	    }
 	}
-	i = is_owner (user_id, mailfile);
-	if (i == 0) {
-		fprintf (stderr,
-		         _("%s: %s not owned by %s, not removing\n"),
-		         Prog, mailfile, user_name);
-		SYSLOG ((LOG_ERR,
-		         "%s not owned by %s, not removed",
-		         mailfile, strerror (errno)));
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "deleting mail file",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_FAILURE);
-#endif
-		return 1;
-	} else if (i == -1) {
-		return 0;		/* mailbox doesn't exist */
-	}
-	if (unlink (mailfile) != 0) {
-		fprintf (stderr,
-		         _("%s: warning: can't remove %s: %s\n"),
-		         Prog, mailfile, strerror (errno));
-		SYSLOG ((LOG_ERR, "Cannot remove %s: %s", mailfile, strerror (errno)));
-#ifdef WITH_AUDIT
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "deleting mail file",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_FAILURE);
-#endif
-		errors = 1;
-		/* continue */
-	}
-#ifdef WITH_AUDIT
-	else
+    }
+  else
+    {
+      setgrent ();
+
+      while ((gr = getgrent ()))
 	{
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "deleting mail file",
-		              user_name, (unsigned int) user_id,
-		              SHADOW_AUDIT_SUCCESS);
-	}
-#endif
-	return errors;
-}
+	  unsigned int i;
 
-/*
- * main - userdel command
- */
-int main (int argc, char **argv)
-{
-	int errors = 0; /* Error in the removal of the home directory */
-
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-	pam_handle_t *pamh = NULL;
-	int retval;
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
-
-#ifdef WITH_AUDIT
-	audit_help_open ();
-#endif
-
-	/*
-	 * Get my name so that I can use it to report errors.
-	 */
-	Prog = Basename (argv[0]);
-	(void) setlocale (LC_ALL, "");
-	(void) bindtextdomain (PACKAGE, LOCALEDIR);
-	(void) textdomain (PACKAGE);
-
-	{
-		/*
-		 * Parse the command line options.
-		 */
-		int c;
-		static struct option long_options[] = {
-			{"force", no_argument, NULL, 'f'},
-			{"help", no_argument, NULL, 'h'},
-			{"remove", no_argument, NULL, 'r'},
-			{NULL, 0, NULL, '\0'}
-		};
-		while ((c = getopt_long (argc, argv, "fhr",
-		                         long_options, NULL)) != -1) {
-			switch (c) {
-			case 'f':	/* force remove even if not owned by user */
-				fflg = true;
-				break;
-			case 'r':	/* remove home dir and mailbox */
-				rflg = true;
-				break;
-			default:
-				usage ();
-			}
-		}
-	}
-
-	if ((optind + 1) != argc) {
-		usage ();
-	}
-
-	OPENLOG ("userdel");
-
-#ifdef ACCT_TOOLS_SETUID
-#ifdef USE_PAM
-	{
-		struct passwd *pampw;
-		pampw = getpwuid (getuid ()); /* local, no need for xgetpwuid */
-		if (pampw == NULL) {
-			fprintf (stderr,
-			         _("%s: Cannot determine your user name.\n"),
-			         Prog);
-			exit (E_PW_UPDATE);
-		}
-
-		retval = pam_start ("userdel", pampw->pw_name, &conv, &pamh);
-	}
-
-	if (PAM_SUCCESS == retval) {
-		retval = pam_authenticate (pamh, 0);
-	}
-
-	if (PAM_SUCCESS == retval) {
-		retval = pam_acct_mgmt (pamh, 0);
-	}
-
-	if (NULL != pamh) {
-		(void) pam_end (pamh, retval);
-	}
-	if (PAM_SUCCESS != retval) {
-		fprintf (stderr, _("%s: PAM authentication failed\n"), Prog);
-		exit (E_PW_UPDATE);
-	}
-#endif				/* USE_PAM */
-#endif				/* ACCT_TOOLS_SETUID */
-
-	is_shadow_pwd = spw_file_present ();
-#ifdef SHADOWGRP
-	is_shadow_grp = sgr_file_present ();
-#endif
-
-	/*
-	 * Start with a quick check to see if the user exists.
-	 */
-	user_name = argv[argc - 1];
-	{
-		struct passwd *pwd;
-		pwd = getpwnam (user_name); /* local, no need for xgetpwnam */
-		if (NULL == pwd) {
-			fprintf (stderr, _("%s: user '%s' does not exist\n"),
-				 Prog, user_name);
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "deleting user not found",
-			              user_name, AUDIT_NO_ID,
-			              SHADOW_AUDIT_FAILURE);
-#endif
-			exit (E_NOTFOUND);
-		}
-		user_id = pwd->pw_uid;
-		user_home = xstrdup (pwd->pw_dir);
-	}
-#ifdef	USE_NIS
-
-	/*
-	 * Now make sure it isn't an NIS user.
-	 */
-	if (__ispwNIS ()) {
-		char *nis_domain;
-		char *nis_master;
-
-		fprintf (stderr,
-			 _("%s: user %s is a NIS user\n"), Prog, user_name);
-		if (   !yp_get_default_domain (&nis_domain)
-		    && !yp_master (nis_domain, "passwd.byname", &nis_master)) {
-			fprintf (stderr,
-				 _("%s: %s is the NIS master\n"),
-				 Prog, nis_master);
-		}
-		exit (E_NOTFOUND);
-	}
-#endif
-	/*
-	 * Check to make certain the user isn't logged in.
-	 * Note: This is a best effort basis. The user may log in between,
-	 * a cron job may be started on her behalf, etc.
-	 */
-	if (user_busy (user_name, user_id) != 0) {
-		fprintf (stderr,
-		         _("%s: user %s is currently logged in\n"),
-		         Prog, user_name);
-		if (!fflg) {
-#ifdef WITH_AUDIT
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "deleting user logged in",
-			              user_name, AUDIT_NO_ID,
-			              SHADOW_AUDIT_FAILURE);
-#endif
-			exit (E_USER_BUSY);
-		}
-	}
-
-	/*
-	 * Do the hard stuff - open the files, create the user entries,
-	 * create the home directory, then close and update the files.
-	 */
-	open_files ();
-	update_user ();
-	update_groups ();
-
-	if (rflg) {
-		errors += remove_mailbox ();
-	}
-	if (rflg) {
-		int home_owned = is_owner (user_id, user_home);
-		if (-1 == home_owned) {
-			fprintf (stderr,
-			         _("%s: %s home directory (%s) not found\n"),
-			         Prog, user_name, user_home);
-			rflg = 0;
-		} else if ((0 == home_owned) && !fflg) {
-			fprintf (stderr,
-			         _("%s: %s not owned by %s, not removing\n"),
-			         Prog, user_home, user_name);
-			rflg = 0;
-			errors++;
-			/* continue */
-		}
-	}
-
-#ifdef EXTRA_CHECK_HOME_DIR
-	/* This may be slow, the above should be good enough. */
-	if (rflg && !fflg) {
-		struct passwd *pwd;
-		/*
-		 * For safety, refuse to remove the home directory if it
-		 * would result in removing some other user's home
-		 * directory. Still not perfect so be careful, but should
-		 * prevent accidents if someone has /home or / as home
-		 * directory...  --marekm
-		 */
-		setpwent ();
-		while ((pwd = getpwent ())) {
-			if (strcmp (pwd->pw_name, user_name) == 0) {
-				continue;
-			}
-			if (path_prefix (user_home, pwd->pw_dir)) {
-				fprintf (stderr,
-					 _
-					 ("%s: not removing directory %s (would remove home of user %s)\n"),
-					 Prog, user_home, pwd->pw_name);
-				rflg = false;
-				errors++;
-				/* continue */
-				break;
-			}
-		}
-		endpwent ();
-	}
-#endif
-
-	if (rflg) {
-		if (remove_tree (user_home) != 0) {
-			fprintf (stderr,
-				 _("%s: error removing directory %s\n"),
-				 Prog, user_home);
-			errors++;
-			/* continue */
-		}
-#ifdef WITH_AUDIT
-		else
+	  for (i = 0; gr->gr_mem[i]; i++)
+	    {
+	      if (strcmp (gr->gr_mem[i], pw_data->pw.pw_name) == 0)
 		{
-			audit_logger (AUDIT_DEL_USER, Prog,
-			              "deleting home directory",
-			              user_name, (unsigned int) user_id,
-			              SHADOW_AUDIT_SUCCESS);
+		  item = malloc (sizeof (*item));
+		  item->value = strdup (gr->gr_name);
+		  item->next = list;
+		  list = item;
 		}
-#endif
+	    }
 	}
-#ifdef WITH_AUDIT
-	if (0 != errors) {
-		audit_logger (AUDIT_DEL_USER, Prog,
-		              "deleting home directory",
-		              user_name, AUDIT_NO_ID,
-		              SHADOW_AUDIT_FAILURE);
+
+      endgrent ();
+    }
+
+  item = list;
+  while (item != NULL)
+    {
+      group_t *gr_data = find_group_data (item->value, 0, NULL);
+
+      if (gr_data == NULL || gr_data->service == S_NONE)
+	{
+	  fprintf (stderr,
+		   _("%s: ERROR: cannot find group `%s' anymore!\n"),
+		   program, item->value);
+	  if (retval == E_SUCCESS)
+	    retval = E_NOTFOUND;
 	}
-#endif
+      else
+	{
+	  gr_data->todo = DO_MODIFY;
 
-#ifdef WITH_SELINUX
-	if (is_selinux_enabled () > 0) {
-		const char *args[5];
-		args[0] = "/usr/sbin/semanage";
-		args[1] = "login";
-		args[2] = "-d";
-		args[3] = user_name;
-		args[4] = NULL;
-		safe_system (args[0], args, NULL, 1);
+#ifdef USE_LDAP
+	  if (gr_data->service == S_LDAP)
+	    {
+	      if (pw_data->binddn == NULL)
+		{
+		  pw_data->binddn = get_caller_dn ();
+		  if (pw_data->binddn == NULL)
+		    {
+		      fprintf (stderr, _("%s: Cannot remove user from groups stored in LDAP database without DN.\n"),
+			       program);
+		    }
+		}
+
+	      if (pw_data->binddn == NULL)
+		{
+		  fprintf (stderr,
+			   _("%s: User not removed from LDAP group `%s'.\n"),
+			   program, gr_data->gr.gr_name);
+		  item = item->next;
+		  free_group_t (gr_data);
+		  retval = E_GRP_UPDATE;
+		  continue;
+		}
+
+	      gr_data->binddn = strdup (pw_data->binddn);
+
+	      if (pw_data->oldclearpwd == NULL)
+		{
+		  char *cp = get_ldap_password (pw_data->binddn);
+
+		  if (cp)
+		    pw_data->oldclearpwd = strdup (cp);
+		  else
+		    {
+		      fprintf (stderr,
+			       _("%s: User not removed from LDAP group `%s'.\n"),
+			       program, gr_data->gr.gr_name);
+		      item = item->next;
+		      free_group_t (gr_data);
+		      retval = E_GRP_UPDATE;
+		      continue;
+		    }
+		}
+	    }
+#endif
+	  if (pw_data->oldclearpwd)
+	    gr_data->oldclearpwd = strdup (pw_data->oldclearpwd);
+
+	  gr_data->new_gr_mem = remove_gr_mem (pw_data->pw.pw_name,
+					       gr_data->gr.gr_mem);
+	  if (write_group_data (gr_data, 1) != 0)
+	    {
+	      sec_log (program, MSG_ERROR_REMOVE_USER_FROM_GROUP,
+		       pw_data->pw.pw_name, pw_data->pw.pw_uid,
+		       gr_data->gr.gr_name, gr_data->gr.gr_gid, getuid ());
+	      fprintf (stderr,
+		       _("%s: User not removed from group `%s'.\n"),
+		       program, gr_data->gr.gr_name);
+	      retval = E_GRP_UPDATE;
+	    }
+	  else
+	    {
+	      sec_log (program, MSG_USER_REMOVED_FROM_GROUP,
+		       pw_data->pw.pw_name, gr_data->gr.gr_name,
+		       gr_data->gr.gr_gid, getuid ())
+	    }
 	}
-#endif
 
-	/*
-	 * Cancel any crontabs or at jobs. Have to do this before we remove
-	 * the entry from /etc/passwd.
-	 */
-	user_cancel (user_name);
-	close_files ();
-
-	nscd_flush_cache ("passwd");
-	nscd_flush_cache ("group");
-
-	return ((0 != errors) ? E_HOMEDIR : E_SUCCESS);
+      item = item->next;
+      free_group_t (gr_data);
+    }
+  return retval;
 }
 
+/* XXX */
+void
+init_environment (void)
+{
+  struct rlimit rlim;
+
+  /* Don't create a core file.  */
+  rlim.rlim_cur = rlim.rlim_max = 0;
+  setrlimit (RLIMIT_CORE, &rlim);
+
+  /* Set all limits to unlimited to avoid to run in any
+     problems later.  */
+  rlim.rlim_cur = rlim.rlim_max = RLIM_INFINITY;
+  setrlimit (RLIMIT_AS, &rlim);
+  setrlimit (RLIMIT_CPU, &rlim);
+  setrlimit (RLIMIT_DATA, &rlim);
+  setrlimit (RLIMIT_FSIZE, &rlim);
+  setrlimit (RLIMIT_NOFILE, &rlim);
+  setrlimit (RLIMIT_RSS, &rlim);
+  setrlimit (RLIMIT_STACK, &rlim);
+
+  /* Ignore all signals which can make trouble later.  */
+  signal (SIGALRM, SIG_IGN);
+  signal (SIGXFSZ, SIG_IGN);
+  signal (SIGHUP, SIG_IGN);
+  /* signal (SIGINT, SIG_IGN); */
+  signal (SIGPIPE, SIG_IGN);
+  /* signal (SIGQUIT, SIG_IGN); */
+  /* signal (SIGTERM, SIG_IGN); */
+  signal (SIGTSTP, SIG_IGN);
+  signal (SIGTTOU, SIG_IGN);
+
+  umask (077);
+}
+
+int
+main (int argc, char **argv)
+{
+  char *use_service = NULL;
+#ifdef USE_LDAP
+  char *binddn = NULL;
+#endif
+  char *remove_user;
+  int have_extrapath = 0;
+  int remove_flag = 0;
+  int force_removal = 0;
+  user_t *pw_data;
+  int retval = E_SUCCESS;
+  int i;
+
+#ifdef ENABLE_NLS
+  setlocale (LC_ALL, "");
+  bindtextdomain (PACKAGE, LOCALEDIR);
+  textdomain (PACKAGE);
+#endif
+
+  open_sec_log (program);
+
+  /* Before going any further, raise the ulimit and ignore
+     signals.  */
+
+  init_environment ();
+
+  while (1)
+    {
+      int c;
+      int option_index = 0;
+
+      c = getopt_long (argc, argv, short_options,
+		       long_options, &option_index);
+      if (c == (-1))
+	break;
+      switch (c)
+	{
+#ifdef USE_LDAP
+	case 'D':
+	  binddn = optarg;
+	  break;
+#endif
+	case 'f':
+	  force_removal = 1;
+	  break;
+	case 'P':
+	  files_etc_dir = strdup (optarg);
+	  have_extrapath = 1;
+	  /* If -P option is used, set service to "files" if not already
+	     set through an option. If we don't limitate to service files,
+	     we can get trouble finding the right source.  */
+	  if (!use_service)
+	    use_service = "files";
+	  break;
+	case 'r':
+	  remove_flag = 1;
+	  break;
+	case '\253':
+	  if (use_service != NULL)
+            {
+              print_usage (stderr, program);
+              return E_BAD_ARG;
+            }
+
+          if (strcasecmp (optarg, "files") == 0)
+            use_service = "files";
+#ifdef USE_LDAP
+          else if (strcasecmp (optarg, "ldap") == 0)
+            use_service = "ldap";
+#endif
+          else
+            {
+              fprintf (stderr, _("Service `%s' not supported.\n"), optarg);
+              print_usage (stderr, program);
+              return E_BAD_ARG;
+            }
+	  break;
+	case '\255':
+	  print_help (program);
+	  return 0;
+	case 'u':
+	  print_usage (stdout, program);
+	  return 0;
+	case 'v':
+	  print_version (program, "2005");
+	  return 0;
+	default:
+	  print_error (program);
+	  return E_USAGE;
+	}
+    }
+
+  argc -= optind;
+  argv += optind;
+
+  if (argc > 1)
+    {
+      fprintf (stderr, _("%s: Too many arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+  else if (argc == 0)
+    {
+      fprintf (stderr, _("%s: Too few arguments.\n"), program);
+      print_error (program);
+      return E_USAGE;
+    }
+  else
+    {
+      int buflen = 256;
+      char *buffer = alloca (buflen);
+      struct passwd resultbuf;
+      struct passwd *pw;
+
+      /* Determine our own user name for PAM authentication.  */
+      while (getpwuid_r (getuid (), &resultbuf, buffer, buflen, &pw) != 0
+	     && errno == ERANGE)
+	{
+	  errno = 0;
+	  buflen += 256;
+	  buffer = alloca (buflen);
+	}
+
+      if (!pw)
+	{
+	  fprintf (stderr, _("%s: Cannot determine your user name.\n"),
+		   program);
+	  return E_UNKNOWN_USER;
+	}
+
+      if (do_authentication ("shadow", pw->pw_name, NULL) != 0)
+	{
+	  sec_log (program, MSG_PERMISSION_DENIED, pw->pw_name,
+                   pw->pw_uid, getuid ());
+	  return E_NOPERM;
+	}
+    }
+
+  remove_user = argv[0];
+
+  pw_data = do_getpwnam (remove_user, use_service);
+  if (pw_data == NULL || pw_data->service == S_NONE)
+    {
+      sec_log (program, MSG_UNKNOWN_USER, remove_user, getuid ());
+      if (use_service)
+	fprintf (stderr, _("%s: User `%s' is not known to service `%s'.\n"),
+		 program, remove_user, use_service);
+      else
+	fprintf (stderr, _("%s: Unknown user `%s'.\n"), program,
+		 remove_user);
+      return E_UNKNOWN_USER;
+    }
+
+  if (is_logged_in (remove_user))
+    {
+      fprintf (stderr, _("%s: account `%s' is currently in use.\n"),
+	       program, remove_user);
+      return E_USER_BUSY;
+    }
+
+#ifdef USE_LDAP
+  if (binddn)
+    {
+      pw_data->binddn = strdup (binddn);
+      if (pw_data->service == S_LDAP)
+	{
+	  char *cp = get_ldap_password (binddn);
+	  if (cp)
+	    pw_data->oldclearpwd = strdup (cp);
+	}
+    }
+#endif
+
+  i = call_script ("USERDEL_PRECMD", pw_data->pw.pw_name, pw_data->pw.pw_uid,
+		   pw_data->pw.pw_gid, pw_data->pw.pw_dir, program);
+  if (i != 0)
+    {
+      fprintf (stderr, _("%s: USERDEL_PRECMD fails with exit code %d.\n"),
+	       program, i);
+      return E_FAILURE;
+    }
+
+  /* Lock passwd file, so that a concurrent useradd process will not
+     add the user a second time or a second user with the same uid.  */
+  if (pw_data->service == S_LOCAL && lock_database () != 0)
+    {
+      sec_log (program, MSG_PASSWD_FILE_ALREADY_LOCKED);
+      fputs (_("Cannot lock password file: already locked.\n"), stderr);
+      return E_PWDBUSY;
+    }
+
+  if (remove_flag)
+    {
+      char *cp;
+      int ret;
+
+      if (asprintf (&cp, "%s/%s", _PATH_MAILDIR, pw_data->pw.pw_name) < 1)
+	return E_FAILURE;
+
+      /* Remove the mail file only if owned by user or -f was given.  */
+      ret = is_owned_by (cp, pw_data->pw.pw_uid);
+      if (ret == 0 && !force_removal)
+	{
+	  sec_log (program, MSG_NOT_OWNED_BY_USER,
+		   cp, pw_data->pw.pw_name, pw_data->pw.pw_uid, getuid ());
+	  fprintf (stderr, _("%s: `%s' is not owned by `%s', not removed.\n"),
+		   program, cp, pw_data->pw.pw_name);
+	}
+      else if (ret == 1 || (ret == 0 && force_removal))
+	{
+	  if (unlink (cp) == -1)
+	    fprintf (stderr, _("%s: warning: can't remove `%s': %s"),
+		     program, cp, strerror (errno));
+	}
+
+      /* Remove the home directory only, if owned by the user and
+	 not used by any other user or -f was given.  */
+      ret = is_owned_by (pw_data->pw.pw_dir, pw_data->pw.pw_uid);
+      if (ret == 0 && !force_removal)
+	{
+	  sec_log (program, MSG_NOT_OWNED_BY_USER,
+		   pw_data->pw.pw_dir, pw_data->pw.pw_name,
+		   pw_data->pw.pw_uid, getuid ());
+	  fprintf (stderr, _("%s: `%s' is not owned by `%s', not removed.\n"),
+		   program, pw_data->pw.pw_dir, pw_data->pw.pw_name);
+	}
+      else if (ret == 1 || (ret == 0 && force_removal))
+	{
+	  if (!in_use_by_other_users (pw_data->pw.pw_dir,
+				      pw_data->pw.pw_name,
+				      have_extrapath) || force_removal)
+	    {
+	      if (remove_dir_rec (pw_data->pw.pw_dir) != 0)
+		fprintf (stderr, _("%s: warning: can't remove `%s': %s"),
+			 program, pw_data->pw.pw_dir, strerror (errno));
+	      else
+		{
+		  sec_log (program, MSG_HOME_DIR_REMOVED,
+			   pw_data->pw.pw_name, pw_data->pw.pw_uid,
+			   pw_data->pw.pw_dir, getuid ());
+		}
+	    }
+	  else
+	    fprintf (stderr, _("%s: directory `%s' not removed.\n"),
+		     program, pw_data->pw.pw_dir);
+	}
+    }
+
+  retval = remove_from_secondary_groups (pw_data, have_extrapath);
+
+  pw_data->todo = DO_DELETE;
+  if (write_user_data (pw_data, 1) != 0)
+    {
+      sec_log (program, MSG_ERROR_REMOVING_USER,
+	       pw_data->pw.pw_name, pw_data->pw.pw_uid, getuid ());
+      fprintf (stderr, _("%s: error deleting user `%s'.\n"),
+	       program, pw_data->pw.pw_name);
+      free_user_t (pw_data);
+      return E_FAILURE;
+    }
+  else
+    sec_log (program, MSG_USER_DELETED,
+	     pw_data->pw.pw_name, pw_data->pw.pw_uid, getuid ());
+
+#ifdef HAVE_NSCD_FLUSH_CACHE
+  /* flush NSCD cache to remove user really from the system.  */
+  nscd_flush_cache ("passwd");
+  nscd_flush_cache ("group");
+#endif
+
+  if (pw_data->service == S_LOCAL)
+    ulckpwdf ();
+
+  i = call_script ("USERDEL_POSTCMD", pw_data->pw.pw_name, pw_data->pw.pw_uid,
+		   pw_data->pw.pw_gid, pw_data->pw.pw_dir, program);
+  if (i != 0)
+    {
+      fprintf (stderr, _("%s: USERDEL_POSTCMD fails with exit code %d.\n"),
+	       program, i);
+      return E_FAILURE;
+    }
+
+  free_user_t (pw_data);
+
+  return retval;
+}

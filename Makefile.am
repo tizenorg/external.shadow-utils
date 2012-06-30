@@ -1,8 +1,14 @@
-## Process this file with automake to produce Makefile.in
+#
+# Copyright (c) 2005 Thorsten Kukuk, Germany
+#
+# Author: Thorsten Kukuk <kukuk@thkukuk.de>
+#
+AUTOMAKE_OPTIONS = 1.8 gnu dist-bzip2
+#
+SUBDIRS = m4 etc lib src plugins po
 
-EXTRA_DIST = NEWS README TODO shadow.spec.in
+CLEANFILES = *~
 
-AUTOMAKE_OPTIONS = 1.5 dist-bzip2 foreign
+ACLOCAL_AMFLAGS = -I m4
 
-SUBDIRS = po man libmisc lib src \
-	contrib doc etc
+EXTRA_DIST = config.rpath
