@@ -119,6 +119,7 @@ main (int argc, char *argv[])
 #endif
         {"path",    required_argument, NULL, 'P' },
         {"crypt",   no_argument, NULL, 'c' },
+        {"md5",     no_argument, NULL, 'm' },
         {"encrypt", no_argument, NULL, 'e' },
         {"service", required_argument, NULL, '\254' },
         {"version", no_argument, NULL, 'v' },
@@ -127,7 +128,7 @@ main (int argc, char *argv[])
         {NULL,      0,           NULL, '\0'}
       };
 
-      c = getopt_long (argc, argv, "D:P:c:evu",
+      c = getopt_long (argc, argv, "D:P:c:mevu",
                        long_options, &option_index);
       if (c == (-1))
         break;
@@ -143,6 +144,9 @@ main (int argc, char *argv[])
           break;
 	case 'c':
 	  use_crypt = parse_crypt_arg (optarg);
+	  break;
+	case 'm':
+	  use_crypt = MD5;
 	  break;
 	case 'e':
 	  ++encrypted;
