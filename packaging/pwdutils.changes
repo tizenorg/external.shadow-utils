@@ -4,7 +4,3 @@
 
 * Sat Jun 30 2012 Anas Nashif <anas.nashif@intel.com> dc8d94d
 - use pwdutils to replace original shadow utils
-
-* Mon Jul 02 2012 Anas Nashif <anas.nashif@intel.com> c65b610
-- use pwdutils instead
-
