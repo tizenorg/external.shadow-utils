@@ -121,6 +121,10 @@ do
 	done;
 done
 
+# license
+mkdir -p %{buildroot}/usr/share/license
+cp COPYING %{buildroot}/usr/share/license/%{name}
+
 %files
 %manifest %{name}.manifest
 %{_datadir}/license/%{name}
@@ -154,3 +158,4 @@ done
 %{_sbindir}/usermod
 %{_sbindir}/vigr
 %{_sbindir}/vipw
+/usr/share/license/%{name}
