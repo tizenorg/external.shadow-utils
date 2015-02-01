@@ -159,4 +159,3 @@ done
 %exclude %{_bindir}/newgrp
 %exclude %{_bindir}/passwd
 %endif
-
