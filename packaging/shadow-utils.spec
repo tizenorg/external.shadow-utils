@@ -1,21 +1,46 @@
 Summary: Utilities for managing accounts and shadow password files
 Name: shadow-utils
 Version: 4.1.4.2
-Release: 1
+Release: 7
 URL: http://pkg-shadow.alioth.debian.org/
-Source0: ftp://pkg-shadow.alioth.debian.org/pub/pkg-shadow/shadow-%{version}.tar.bz2
-Source1: shadow-4.0.17-login.defs
-Source2: shadow-4.0.18.1-useradd
-Patch0: shadow-4.1.4.2-redhat.patch
-Patch1: shadow-4.1.4.1-goodname.patch
-Patch2: shadow-4.1.4.2-leak.patch
-Patch3: shadow-4.1.4.2-fixes.patch
-License: BSD and GPLv2+
+License: BSD-2.0 and GPL-2.0+
 Group: System/Base
+
+Source0: http://pkg-shadow.alioth.debian.org/releases/shadow-%{version}.tar.gz
+%if 0%{?tizen_build_binary_release_type_eng:1}
+Source1: login-eng.defs
+%else
+Source1: login.defs
+%endif
+Source2: securetty
+Source3: useradd.default
+Source1001:     %{name}.manifest
+
+Patch0: 008_login_log_failure_in_FTMP
+Patch1: 008_su_get_PAM_username
+Patch2: 008_su_no_sanitize_env
+Patch3: 401_cppw_src.dpatch
+Patch4: 402_cppw_selinux
+Patch5: 428_grpck_add_prune_option
+Patch6: 429_login_FAILLOG_ENAB
+Patch7: 463_login_delay_obeys_to_PAM
+Patch8: 483_su_fakelogin_wrong_arg0
+Patch9: 501_commonio_group_shadow
+Patch10: 506_relaxed_usernames
+Patch11: 508_nologin_in_usr_sbin
+Patch12: 523_su_arguments_are_concatenated
+Patch13: 523_su_arguments_are_no_more_concatenated_by_default
+Patch14: 542_useradd-O_option
+Patch15: shadow-4.1.4.2-redhat.patch
+Patch16: shadow-4.1.4.1-goodname.patch
+Patch17: shadow-4.1.4.2-leak.patch
+Patch18: shadow-4.1.4.2-fixes.patch
+Patch19: shadow-4.1.4.2-rounds_prefix.patch
+
 Requires: setup
 
 %description
-The shadow-utils package includes the necessary programs for
+The shadow package includes the necessary programs for
 converting UNIX password files to the shadow password format, plus
 programs for managing user and group accounts. The pwconv command
 converts passwords to the shadow password format. The pwunconv command
@@ -27,142 +52,110 @@ managing user accounts. The groupadd, groupdel, and groupmod commands
 are used for managing group accounts.
 
 %prep
-%setup -q -n shadow-%{version}
-%patch0 -p1 -b .redhat
-%patch1 -p1 -b .goodname
-%patch2 -p1 -b .leak
-%patch3 -p1 -b .fixes
+%setup -q
 
-iconv -f ISO88591 -t utf-8  doc/HOWTO > doc/HOWTO.utf8
-cp -f doc/HOWTO.utf8 doc/HOWTO
+%patch0 -p1 -b .008_login_log_failure_in_FTMP
+%patch1 -p1 -b .008_su_get_PAM_username
+%patch2 -p1 -b .008_su_no_sanitize_env
+%patch3 -p1 -b .401_cppw_src.dpatch
+%patch4 -p1 -b .402_cppw_selinux
+%patch5 -p1 -b .428_grpck_add_prune_option
+%patch6 -p1 -b .429_login_FAILLOG_ENAB
+%patch7 -p1 -b .463_login_delay_obeys_to_PAM
+%patch8 -p1 -b .483_su_fakelogin_wrong_arg0
+%patch9 -p1 -b .501_commonio_group_shadow
+%patch10 -p1 -b .506_relaxed_usernames
+%patch11 -p1 -b .508_nologin_in_usr_sbin
+%patch12 -p1 -b .523_su_arguments_are_concatenated
+%patch13 -p1 -b .523_su_arguments_are_no_more_concatenated_by_default
+%patch14 -p1 -b .542_useradd-O_option
+%patch15 -p1 -b .redhat
+%patch16 -p1 -b .goodname
+%patch17 -p1 -b .leak
+%patch18 -p1 -b .fixes
+%patch19 -p1 -b .rounds_prefix
 
 %build
-%configure \
-        --enable-shadowgrp \
-        --without-audit \
-        --with-sha-crypt \
-        --without-selinux \
-        --without-libcrack \
-        --without-libpam \
-        --disable-shared
+cp %{SOURCE1001} .
+%configure --without-libcrack --without-audit --mandir=/usr/share/man --without-libpam --without-selinux --enable-shadowgrp --disable-man --disable-account-tools-setuid --with-group-name-max-length=32 --disable-nls
+
 make
 
 %install
-rm -rf $RPM_BUILD_ROOT
-make install DESTDIR=$RPM_BUILD_ROOT gnulocaledir=$RPM_BUILD_ROOT/%{_datadir}/locale MKINSTALLDIRS=`pwd`/mkinstalldirs
-install -d -m 755 $RPM_BUILD_ROOT/%{_sysconfdir}/default
-install -p -c -m 0644 %{SOURCE1} $RPM_BUILD_ROOT/%{_sysconfdir}/login.defs
-install -p -c -m 0600 %{SOURCE2} $RPM_BUILD_ROOT/%{_sysconfdir}/default/useradd
+make install DESTDIR=%{buildroot}
+install -d %{buildroot}/%{_sysconfdir}/default
+install -c -m 444 %SOURCE1 %{buildroot}/%{_sysconfdir}/login.defs
+install -c -m 444 %SOURCE2 %{buildroot}/%{_sysconfdir}/
+install -c -m 644 %SOURCE3 %{buildroot}/%{_sysconfdir}/default/useradd
+install -d %{buildroot}/sbin
 
+chmod u+s %{buildroot}/%{_bindir}/su
 
-ln -s useradd $RPM_BUILD_ROOT%{_sbindir}/adduser
-#ln -s %{_mandir}/man8/useradd.8 $RPM_BUILD_ROOT/%{_mandir}/man8/adduser.8
-ln -s useradd.8 $RPM_BUILD_ROOT/%{_mandir}/man8/adduser.8
-for subdir in $RPM_BUILD_ROOT/%{_mandir}/{??,??_??,??_??.*}/man* ; do
-        test -d $subdir && test -e $subdir/useradd.8 && echo ".so man8/useradd.8" > $subdir/adduser.8
+install -d %{buildroot}/bin
+mv %{buildroot}/%{_bindir}/su %{buildroot}/bin/
+mv %{buildroot}/%{_bindir}/login %{buildroot}/bin/
+
+# remove not needed files
+rm %{buildroot}/%{_sbindir}/logoutd
+rm %{buildroot}/%{_bindir}/groups
+rm %{buildroot}/%{_sysconfdir}/login.access
+rm %{buildroot}/%{_sysconfdir}/limits
+rm %{buildroot}/%{_sysconfdir}/securetty
+rm %{buildroot}/%{_bindir}/chfn
+rm %{buildroot}/%{_bindir}/chsh
+rm %{buildroot}/%{_bindir}/expiry
+rm %{buildroot}/%{_sbindir}/chgpasswd
+rm %{buildroot}/%{_sbindir}/grpck
+rm %{buildroot}/%{_sbindir}/grpconv
+rm %{buildroot}/%{_sbindir}/grpunconv
+rm %{buildroot}/%{_sbindir}/pwck
+rm %{buildroot}/%{_sbindir}/pwconv
+rm %{buildroot}/%{_sbindir}/pwunconv
+rm %{buildroot}/%{_sbindir}/vigr
+rm %{buildroot}/%{_sbindir}/vipw
+
+%remove_docs
+
+mkdir -p $RPM_BUILD_ROOT%{_datadir}/license
+for keyword in LICENSE COPYING COPYRIGHT;
+do
+	for file in `find %{_builddir} -name $keyword`;
+	do
+		cat $file >> $RPM_BUILD_ROOT%{_datadir}/license/%{name};
+		echo "";
+	done;
 done
 
-# Remove binaries we don't use.
-rm $RPM_BUILD_ROOT/%{_bindir}/chfn
-rm $RPM_BUILD_ROOT/%{_bindir}/chsh
-rm $RPM_BUILD_ROOT/%{_bindir}/expiry
-rm $RPM_BUILD_ROOT/%{_bindir}/groups
-rm $RPM_BUILD_ROOT/%{_bindir}/login
-rm $RPM_BUILD_ROOT/%{_bindir}/passwd
-rm $RPM_BUILD_ROOT/%{_bindir}/su
-rm $RPM_BUILD_ROOT/%{_sysconfdir}/login.access
-rm $RPM_BUILD_ROOT/%{_sysconfdir}/limits
-rm $RPM_BUILD_ROOT/%{_sbindir}/logoutd
-rm $RPM_BUILD_ROOT/%{_sbindir}/nologin
-rm $RPM_BUILD_ROOT/%{_sbindir}/chgpasswd
-rm $RPM_BUILD_ROOT/%{_mandir}/man1/chfn.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man1/chfn.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man1/chsh.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man1/chsh.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man1/expiry.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man1/expiry.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man1/groups.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man1/groups.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man1/login.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man1/login.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man1/passwd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man1/passwd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man1/su.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man1/su.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man5/limits.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man5/limits.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man5/login.access.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man5/login.access.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man5/passwd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man5/passwd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man5/porttime.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man5/porttime.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man5/suauth.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man5/suauth.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man8/logoutd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man8/logoutd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man8/nologin.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man8/nologin.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man8/chgpasswd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man8/chgpasswd.*
-rm $RPM_BUILD_ROOT/%{_mandir}/man3/getspnam.*
-rm $RPM_BUILD_ROOT/%{_mandir}/*/man3/getspnam.*
-
-%find_lang shadow
-find $RPM_BUILD_ROOT%{_mandir} -depth -type d -empty -delete
-for dir in $(ls -1d $RPM_BUILD_ROOT%{_mandir}/{??,??_??}) ; do
-    dir=$(echo $dir | sed -e "s|^$RPM_BUILD_ROOT||")
-    lang=$(basename $dir)
-    echo "%%lang($lang) $dir" >> shadow.lang
-    echo "%%lang($lang) $dir/man*" >> shadow.lang
-#    echo "%%lang($lang) $dir/man*/*" >> shadow.lang
-done
-
-%clean
-rm -rf $RPM_BUILD_ROOT
-
-%files -f shadow.lang
-%defattr(-,root,root)
-%doc NEWS doc/HOWTO README
+%files
+%manifest %{name}.manifest
+%{_datadir}/license/%{name}
 %dir %{_sysconfdir}/default
-#%attr(0644,root,root)   %config(noreplace) %{_sysconfdir}/login.defs
-%exclude %{_sysconfdir}/login.defs
 %attr(0600,root,root)   %config(noreplace) %{_sysconfdir}/default/useradd
+%attr(0644,root,root)   %config(noreplace) %{_sysconfdir}/login.defs
+/bin/login
+%{_bindir}/faillog
+%{_bindir}/lastlog
 %{_bindir}/sg
-%{_bindir}/chage
-%exclude %{_bindir}/faillog
-%{_bindir}/gpasswd
-%exclude %{_bindir}/lastlog
-%exclude %{_bindir}/newgrp
-%exclude %{_sbindir}/adduser
-%attr(0750,root,root)   %{_sbindir}/user*
-%attr(0750,root,root)   %{_sbindir}/group*
-%{_sbindir}/grpck
-%{_sbindir}/pwck
-%{_sbindir}/*conv
-%exclude %{_sbindir}/chpasswd
+%{_sbindir}/chpasswd
+%{_sbindir}/groupadd
+%{_sbindir}/groupdel
+%{_sbindir}/groupmems
+%{_sbindir}/groupmod
 %{_sbindir}/newusers
-%{_sbindir}/vipw
-%{_sbindir}/vigr
-%{_mandir}/man1/chage.1*
-%{_mandir}/man1/gpasswd.1*
-%{_mandir}/man1/sg.1*
-%{_mandir}/man1/newgrp.1*
-%{_mandir}/man3/shadow.3*
-%{_mandir}/man5/shadow.5*
-%{_mandir}/man5/login.defs.5*
-%{_mandir}/man5/gshadow.5*
-%{_mandir}/man5/faillog.5*
-%{_mandir}/man8/adduser.8*
-%{_mandir}/man8/group*.8*
-%{_mandir}/man8/user*.8*
-%{_mandir}/man8/pwck.8*
-%{_mandir}/man8/grpck.8*
-%{_mandir}/man8/chpasswd.8*
-%{_mandir}/man8/newusers.8*
-%{_mandir}/man8/*conv.8*
-%{_mandir}/man8/lastlog.8*
-%{_mandir}/man8/faillog.8*
-%{_mandir}/man8/vipw.8*
-%{_mandir}/man8/vigr.8*
-
+%{_sbindir}/nologin
+%{_sbindir}/useradd
+%{_sbindir}/userdel
+%{_sbindir}/usermod
+%if 0%{?tizen_build_binary_release_type_eng} == 1
+/bin/su
+%{_bindir}/chage
+%{_bindir}/gpasswd
+%{_bindir}/newgrp
+%{_bindir}/passwd
+%else
+%exclude /bin/su
+%exclude %{_bindir}/chage
+%exclude %{_bindir}/gpasswd
+%exclude %{_bindir}/newgrp
+%exclude %{_bindir}/passwd
+%endif
