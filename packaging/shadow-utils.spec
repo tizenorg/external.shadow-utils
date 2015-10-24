@@ -117,7 +117,7 @@ rm %{buildroot}/%{_sbindir}/vipw
 %remove_docs
 
 mkdir -p $RPM_BUILD_ROOT%{_datadir}/license
-for keyword in LICENSE COPYING COPYRIGHT;
+for keyword in LICENSE COPYING COPYRIGHT COPYING.GPL-v2.0+;
 do
 	for file in `find %{_builddir} -name $keyword`;
 	do
